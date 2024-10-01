@@ -16,7 +16,16 @@ def main():
     for idx, player in enumerate(available_players):
         print(f"{idx+1}. {player}")
 
-    choice = int(input("Select a player to invite (number): "))
+    while True:
+        try:
+            choice = int(input("Select a player to invite (number): "))
+            if 1 <= choice <= len(available_players):
+                break
+            else:
+                print(f"Please enter a number between 1 and {len(available_players)}.")
+        except ValueError:
+            print("Invalid input. Please enter a valid number.")
+
     selected_player = available_players[choice - 1]
     player_ip, player_port = selected_player.split(':')
 
@@ -32,7 +41,6 @@ def main():
         if response == "ACCEPTED":
             print("Invitation accepted.")
 
-            # Start TCP server
             tcp_port = 19000 
             threading.Thread(target=start_tcp_server, args=(tcp_port,)).start()
             time.sleep(1)  # Give some time for TCP server to start
