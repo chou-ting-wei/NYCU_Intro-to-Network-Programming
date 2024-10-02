@@ -18,11 +18,14 @@ def main():
 
     while True:
         try:
-            choice = int(input("Select a player to invite (number): "))
-            if 1 <= choice <= len(available_players):
+            choice = int(input("Select a player to invite (number), or enter 0 to exit: "))
+            if choice == 0:
+                print("Exiting the program...")
+                exit() 
+            elif 1 <= choice <= len(available_players):
                 break
             else:
-                print(f"Please enter a number between 1 and {len(available_players)}.")
+                print(f"Please enter a number between 1 and {len(available_players)}, or 0 to exit.")
         except ValueError:
             print("Invalid input. Please enter a valid number.")
 
