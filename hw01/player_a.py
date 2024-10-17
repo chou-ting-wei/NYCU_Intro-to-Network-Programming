@@ -62,14 +62,13 @@ def scan_for_players():
         '140.113.235.154',  # linux4.cs.nycu.edu.tw
     ]
 
-    port_range = range(18000, 18010) 
+    port = 18324
     available_players = []
 
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.settimeout(0.5)
 
     for server in servers:
-        for port in port_range:
             udp_sock.sendto(b"ARE_YOU_AVAILABLE", (server, port))
 
     start_time = time.time()

@@ -5,7 +5,7 @@ import socket
 
 def main():
     UDP_IP = ''
-    UDP_PORT = 18000 
+    UDP_PORT = 18324 
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
