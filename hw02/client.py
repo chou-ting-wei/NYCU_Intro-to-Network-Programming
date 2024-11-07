@@ -205,116 +205,35 @@ ASCII_ART = {
 
 VALID_MOVES = ['rock', 'paper', 'scissors']
 
-host_move = None
-client_move = None
-
-async def handle_p2p_client(reader, writer):
-    """Handles incoming P2P client connections and game communication"""
-    global host_move, client_move
-    try:
-        print("P2P connection established")
-        
-        # Reset moves for a new game
-        host_move, client_move = None, None
-
-        # Host chooses their move first
-        if peer_info["role"] == "host":
-            host_move = await get_move("Host")
-            # await send_message(writer, {"move": host_move, "player": "Host"})
-
-        # Process incoming messages
-        await receive_messages(reader, writer)
-        
-    except Exception as e:
-        logging.error(f"P2P connection error: {e}")
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-async def receive_messages(reader, writer):
-    """Receives and processes messages from the game server or peer"""
-    global host_move, client_move
-    try:
-        while True:
-            data = await reader.read(1024)
-            if not data:
-                print("\nConnection closed by the server.")
-                logging.info("Connection closed by the server.")
-                break
-            message = data.decode().strip()
-            logging.debug(f"Received message: {message}")
-            if message:
-                try:
-                    message_json = json.loads(message)
-                    player = message_json.get("player")
-                    move = message_json.get("move")
-                    
-                    if message_json.get("status") == "result":
-                        display_result(message_json)
-                    
-                    # Capture moves based on role
-                    if player == "Host":
-                        host_move = move
-                    elif player == "Client":
-                        client_move = move
-                    
-                    # Once both moves are in, determine and broadcast the result
-                    if host_move and client_move:
-                        result = determine_winner(host_move, client_move)
-                        result_message = {
-                            "status": "result",
-                            "player1_move": host_move,
-                            "player2_move": client_move,
-                            "result": result
-                        }
-                        
-                        # Send result to both players
-                        await send_message(writer, result_message)
-                        display_result(result_message)
-                        
-                        # Reset moves for a new game if needed
-                        host_move, client_move = None, None
-                        server_close_event.set()
-                        break
-                except json.JSONDecodeError:
-                    print(f"\nUnable to decode message: {message}")
-    except Exception as e:
-        logging.error(f"Error receiving messages: {e}")
-        
-def determine_winner(move1, move2):
-    """Determines the game result"""
-    if move1 == move2:
-        return "Draw"
-    elif (move1 == 'rock' and move2 == 'scissors') or \
-         (move1 == 'paper' and move2 == 'rock') or \
-         (move1 == 'scissors' and move2 == 'paper'):
-        return "Host Wins"
-    else:
-        return "Client Wins"
-
-
 async def start_rps_game_as_host(own_port):
-    # Start server and listen on specified port
-    server = await asyncio.start_server(handle_p2p_client, '0.0.0.0', own_port)
-    
-    """Starts RPS game as the host and shuts down after game ends"""
+    """Starts RPS game as the host"""
+    server = await asyncio.start_server(handle_rps_client, '0.0.0.0', own_port)
     logging.info(f"Waiting for client connection at {own_port} as the Rock-Paper-Scissors host...")
     print(f"Waiting for client connection at {own_port} as the Rock-Paper-Scissors host...")
-    
-    # Create an event to signal server shutdown
+
     global server_close_event
     server_close_event = asyncio.Event()
 
     async def stop_server():
-        await server_close_event.wait()  # Wait until the game ends
+        await server_close_event.wait()
         server.close()
         await server.wait_closed()
         print("Game server has been shut down.")
 
-    # Start the server and shutdown coroutine
     async with server:
         await asyncio.gather(server.serve_forever(), stop_server())
 
+async def handle_rps_client(reader, writer):
+    """Handles RPS game logic for the host"""
+    try:
+        print("Rock-Paper-Scissors client connected.")
+        await rps_game_loop(reader, writer, "Host")
+    except Exception as e:
+        logging.error(f"Rock-Paper-Scissors host error: {e}")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        
 async def start_rps_game_as_client(peer_ip, peer_port, max_retries=10, retry_delay=2):
     """Starts RPS game as the client, retrying until the server is ready"""
     writer = None
@@ -325,13 +244,7 @@ async def start_rps_game_as_client(peer_ip, peer_port, max_retries=10, retry_del
             print(f"Connecting to the Rock-Paper-Scissors host at {peer_ip}:{peer_port} as a client... (Attempt {retries + 1})")
             reader, writer = await asyncio.open_connection(peer_ip, peer_port)
             print("Connected to the host")
-
-            # Get and send player's move
-            player_move = await get_move("Client")
-            await send_message(writer, {"move": player_move, "player": "Client"})
-
-            # Wait for game result
-            await receive_messages(reader, writer)
+            await rps_game_loop(reader, writer, "Client")
             break  # Exit the loop if the connection is successful
 
         except ConnectionRefusedError:
@@ -353,8 +266,92 @@ async def start_rps_game_as_client(peer_ip, peer_port, max_retries=10, retry_del
         await writer.wait_closed()
 
 
+async def rps_game_loop(reader, writer, role):
+    """Main game loop for Rock-Paper-Scissors"""
+    my_move = None
+    opponent_move = None
+    game_over = False
+
+    while not game_over:
+        if role == "Host":
+            # Host chooses move first
+            my_move = await get_rps_move("Host")
+            await send_message(writer, {"move": my_move})
+            print("等待對手的移動...")
+            data = await reader.read(1024)
+            if not data:
+                print("對手斷開連接。")
+                game_over = True
+                break
+            try:
+                message = json.loads(data.decode())
+                opponent_move = message.get("move")
+                if opponent_move not in VALID_MOVES:
+                    print("收到無效的移動。")
+                    continue
+            except json.JSONDecodeError:
+                print("收到無效的訊息。")
+                continue
+        else:
+            # Client waits for host's move
+            print("等待對手的移動...")
+            data = await reader.read(1024)
+            if not data:
+                print("對手斷開連接。")
+                game_over = True
+                break
+            try:
+                message = json.loads(data.decode())
+                opponent_move = message.get("move")
+                if opponent_move not in VALID_MOVES:
+                    print("收到無效的移動。")
+                    continue
+            except json.JSONDecodeError:
+                print("收到無效的訊息。")
+                continue
+            my_move = await get_rps_move("Client")
+            await send_message(writer, {"move": my_move})
+
+        # Determine and display result
+        result = determine_rps_winner(my_move, opponent_move, role)
+        display_rps_result(my_move, opponent_move, result, role)
+        game_over = True
+        server_close_event.set()
+
+async def get_rps_move(player):
+    """Prompts the player to choose a move"""
+    while True:
+        move = await get_user_input(f"Player {player}, choose rock, paper, or scissors: ")
+        move = move.strip().lower()
+        if move in VALID_MOVES:
+            print(ASCII_ART.get(move, ''))
+            return move
+        else:
+            print("Invalid choice, please try again.")
+
+def determine_rps_winner(my_move, opponent_move, role):
+    """Determines the game result"""
+    if my_move == opponent_move:
+        return "Draw"
+    elif (my_move == 'rock' and opponent_move == 'scissors') or \
+         (my_move == 'paper' and opponent_move == 'rock') or \
+         (my_move == 'scissors' and opponent_move == 'paper'):
+        return f"Player {role} Wins"
+    else:
+        return f"Player {'Client' if role == 'Host' else 'Host'} Wins"
+
+def display_rps_result(my_move, opponent_move, result, role):
+    """Displays the game result"""
+    print("\n=== Game Result ===")
+    print(f"Your move: {my_move}")
+    print(ASCII_ART.get(my_move, ''))
+    print(f"Opponent's move: {opponent_move}")
+    print(ASCII_ART.get(opponent_move, ''))
+    print(f"Result: {result}")
+    print("================")
+
 async def send_message(writer, message):
-    """Send a message to the server"""
+    """Send a message to the peer"""
     try:
         data = json.dumps(message).encode()
         writer.write(data)
@@ -362,25 +359,9 @@ async def send_message(writer, message):
     except Exception as e:
         logging.error(f"Error sending message: {e}")
 
-def display_result(result_message):
-    """Displays the game result"""
-    print("\n=== Game Result ===")
-    print(f"Host chose: {result_message.get('player1_move')}")
-    print(ASCII_ART.get(result_message.get('player1_move'), ''))
-    print(f"Client chose: {result_message.get('player2_move')}")
-    print(ASCII_ART.get(result_message.get('player2_move'), ''))
-    print(f"Result: {result_message.get('result')}")
-    print("================")
-
-async def get_move(player_name):
-    """Prompts the player to choose a move"""
-    while True:
-        move = input(f"{player_name}, choose rock, paper, or scissors: ").strip().lower()
-        if move in VALID_MOVES:
-            print(ASCII_ART.get(move, ''))
-            return move
-        else:
-            print("Invalid choice, please try again.")
+async def get_user_input(prompt):
+    """Asynchronous wrapper for input()"""
+    return await asyncio.get_event_loop().run_in_executor(None, input, prompt)
 
 # -------------------------
 # Tic-Tac-Toe Game Functions
