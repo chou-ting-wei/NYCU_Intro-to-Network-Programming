@@ -1,5 +1,3 @@
-# auth.py
-
 import hashlib
 import os
 
