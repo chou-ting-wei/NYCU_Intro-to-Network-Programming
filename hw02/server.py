@@ -199,7 +199,8 @@ async def handle_create_room(params, username, writer):
                 "status": room["status"]
             }
             for r_id, room in game_rooms.items()
-            if room["type"] == "public" and room["status"] != "In Game"
+            # if room["type"] == "public" and room["status"] != "In Game"
+            if room["type"] == "public"
         ]
     public_rooms_message = {
         "status": "update",
@@ -293,7 +294,8 @@ async def handle_join_room(params, username, writer):
                 "status": room["status"]
             }
             for r_id, room in game_rooms.items()
-            if room["type"] == "public" and room["status"] != "In Game"
+            # if room["type"] == "public" and room["status"] != "In Game"
+            if room["type"] == "public"
         ]
     public_rooms_message = {
         "status": "update",
@@ -417,7 +419,8 @@ async def handle_accept_invite(params, username, writer):
                 "status": room["status"]
             }
             for r_id, room in game_rooms.items()
-            if room["type"] == "public" and room["status"] != "In Game"
+            # if room["type"] == "public" and room["status"] != "In Game"
+            if room["type"] == "public"
         ]
     public_rooms_message = {
         "status": "update",
@@ -464,7 +467,8 @@ async def handle_show_status(writer):
                     "status": room["status"]
                 }
                 for r_id, room in game_rooms.items()
-                if room["type"] == "public" and room["status"] != "In Game"
+                # if room["type"] == "public" and room["status"] != "In Game"
+                if room["type"] == "public"
             ]
         
         status_message = "=== 公開房間列表 ===\n"
@@ -533,7 +537,8 @@ async def handle_game_over(username):
                 "status": room["status"]
             }
             for r_id, room in game_rooms.items()
-            if room["type"] == "public" and room["status"] != "In Game"
+            # if room["type"] == "public" and room["status"] != "In Game"
+            if room["type"] == "public"
         ]
     public_rooms_message = {
         "status": "update",
