@@ -39,11 +39,12 @@ async def send_message(writer, message):
         logger.error(f"發送訊息失敗: {e}")
 
 async def broadcast(message):
-    """向所有在線用戶廣播訊息"""
+    """Broadcast a message to all online users."""
     async with online_users_lock:
-        for user, info in online_users.items():
-            writer = info["writer"]
-            await send_message(writer, message)
+        writers = [info["writer"] for info in online_users.values()]
+    for writer in writers:
+        await send_message(writer, message)
+
 
 async def send_lobby_info(writer):
     """向特定用戶發送線上用戶和公開房間列表"""
@@ -151,34 +152,38 @@ async def handle_login(params, reader, writer):
             await send_message(writer, build_response("error", "Incorrect password"))
 
 async def handle_logout(username, writer):
+    user_removed = False
     async with online_users_lock:
         if username in online_users:
             # Remove user from online users list
             del online_users[username]
-            
-            # Send logout success message to the client
-            try:
-                await send_message(writer, build_response("success", "LOGOUT_SUCCESS"))
-            except Exception as e:
-                logger.error(f"Failed to send logout success message to {username}: {e}")
-            
-            # Broadcast updated online users list
-            try:
+            user_removed = True
+    if user_removed:
+        # Send logout success message to the client
+        try:
+            await send_message(writer, build_response("success", "LOGOUT_SUCCESS"))
+        except Exception as e:
+            logger.error(f"Failed to send logout success message to {username}: {e}")
+        
+        # Broadcast updated online users list
+        try:
+            # Collect users_data without holding the lock during I/O
+            async with online_users_lock:
                 users_data = [
                     {"username": user, "status": info["status"]}
                     for user, info in online_users.items()
                 ]
-                online_users_message = {
-                    "status": "update",
-                    "type": "online_users",
-                    "data": users_data
-                }
-                await broadcast(json.dumps(online_users_message) + '\n')
-                logger.info(f"User logged out: {username}")
-            except Exception as e:
-                logger.error(f"Failed to broadcast updated online users list after logout: {e}")
-        else:
-            await send_message(writer, build_response("error", "User not logged in"))
+            online_users_message = {
+                "status": "update",
+                "type": "online_users",
+                "data": users_data
+            }
+            await broadcast(json.dumps(online_users_message) + '\n')
+            logger.info(f"User logged out: {username}")
+        except Exception as e:
+            logger.error(f"Failed to broadcast updated online users list after logout: {e}")
+    else:
+        await send_message(writer, build_response("error", "User not logged in"))
 
 async def handle_create_room(params, username, writer):
     if len(params) != 2:
@@ -188,7 +193,7 @@ async def handle_create_room(params, username, writer):
     if room_type not in ['public', 'private']:
         await send_message(writer, build_response("error", "Invalid room type"))
         return
-    if game_type not in ['rock_paper_scissors', 'tictactoe']:
+    if game_type not in ['rock_paper_scissors', 'tictactoe', 'connectfour']:
         await send_message(writer, build_response("error", "Invalid game type"))
         return
     room_id = str(uuid.uuid4())
@@ -198,9 +203,7 @@ async def handle_create_room(params, username, writer):
             'type': room_type,
             'game_type': game_type,
             'status': 'Waiting',
-            'players': [username],
-            # 'game_server_ip': None,
-            # 'game_server_port': None
+            'players': [username]
         }
     # Update user's status to "in_room"
     async with online_users_lock:
@@ -302,29 +305,6 @@ async def handle_join_room(params, username, writer):
                 }
                 await send_message(creator_info["writer"], json.dumps(creator_message) + '\n')
                 await send_message(joiner_info["writer"], json.dumps(joiner_message) + '\n')
-    #         # 動態分配 Port
-    #         game_server_port = find_available_port()
-    #         room['game_server_ip'] = config.HOST
-    #         room['game_server_port'] = game_server_port
-    #         # 啟動相應的遊戲伺服器
-    #         if room['game_type'] == 'rock_paper_scissors':
-    #             subprocess.Popen([sys.executable, config.GAME_SERVER_RPS_SCRIPT, config.HOST, str(game_server_port), room_id])
-    #             logger.info(f"啟動 Rock-Paper-Scissors 遊戲伺服器在 {config.HOST}:{game_server_port}，房間ID: {room_id}")
-    #         elif room['game_type'] == 'tictactoe':
-    #             subprocess.Popen([sys.executable, config.GAME_SERVER_TICTACTOE_SCRIPT, config.HOST, str(game_server_port), room_id])
-    #             logger.info(f"啟動 Tic-Tac-Toe 遊戲伺服器在 {config.HOST}:{game_server_port}，房間ID: {room_id}")
-    #     # 發送遊戲伺服器資訊給所有玩家
-    #     game_server_info_message = {
-    #         "status": "game_server_info",
-    #         "room_id": room_id,
-    #         "game_server_ip": room['game_server_ip'],
-    #         "game_server_port": room['game_server_port'],
-    #         "game_type": room['game_type']
-    #     }
-    #     for player in room['players']:
-    #         if player in online_users:
-    #             player_writer = online_users[player]["writer"]
-    #             await send_message(player_writer, json.dumps(game_server_info_message) + '\n')
         logger.info(f"遊戲伺服器資訊已發送給房間內玩家: {room_id}")
 
     # Broadcast updated public rooms list
@@ -348,113 +328,150 @@ async def handle_join_room(params, username, writer):
     logger.info(f"用戶 {username} 加入房間: {room_id}")
 
 async def handle_invite_player(params, username, writer):
-    pass
-    # if len(params) != 2:
-    #     await send_message(writer, build_response("error", "Invalid INVITE_PLAYER command"))
-    #     return
-    # target_username, room_id = params
-    # async with game_rooms_lock:
-    #     if room_id not in game_rooms:
-    #         await send_message(writer, build_response("error", "Room does not exist"))
-    #         return
-    #     room = game_rooms[room_id]
-    #     if room['creator'] != username:
-    #         await send_message(writer, build_response("error", "Only room creator can invite players"))
-    #         return
-    #     if len(room['players']) >= 2:
-    #         await send_message(writer, build_response("error", "Room is full"))
-    #         return
-    # async with online_users_lock:
-    #     if target_username not in online_users:
-    #         await send_message(writer, build_response("error", "Target user not online"))
-    #         return
-    #     target_info = online_users[target_username]
-    #     target_writer = target_info["writer"]
-    # try:
-    #     invite_message = {
-    #         "status": "invite",
-    #         "from": username,
-    #         "room_id": room_id
-    #     }
-    #     await send_message(target_writer, json.dumps(invite_message) + '\n')
-    #     await send_message(writer, build_response("success", f"INVITE_SENT {target_username} {room_id}"))
-    #     logger.info(f"用戶 {username} 邀請 {target_username} 加入房間: {room_id}")
-    # except Exception as e:
-    #     logger.error(f"發送邀請給 {target_username} 失敗: {e}")
-    #     await send_message(writer, build_response("error", "Failed to send invite"))
+    if len(params) != 2:
+        await send_message(writer, build_response("error", "Invalid INVITE_PLAYER command"))
+        return
+    target_username, room_id = params
+    async with game_rooms_lock:
+        if room_id not in game_rooms:
+            await send_message(writer, build_response("error", "Room does not exist"))
+            return
+        room = game_rooms[room_id]
+        if room['creator'] != username:
+            await send_message(writer, build_response("error", "Only room creator can invite players"))
+            return
+        if room['type'] != 'private':
+            await send_message(writer, build_response("error", "Cannot invite players to a public room"))
+            return
+        if len(room['players']) >= 2:
+            await send_message(writer, build_response("error", "Room is full"))
+            return
+    async with online_users_lock:
+        if target_username not in online_users:
+            await send_message(writer, build_response("error", "Target user not online"))
+            return
+        target_info = online_users[target_username]
+        if target_info["status"] != "idle":
+            await send_message(writer, build_response("error", "Target user is not idle"))
+            return
+        target_writer = target_info["writer"]
+    try:
+        invite_message = {
+            "status": "invite",
+            "from": username,
+            "room_id": room_id
+        }
+        await send_message(target_writer, json.dumps(invite_message) + '\n')
+        await send_message(writer, build_response("success", f"INVITE_SENT {target_username} {room_id}"))
+        logger.info(f"User {username} invited {target_username} to join room: {room_id}")
+    except Exception as e:
+        logger.error(f"Failed to send invite to {target_username}: {e}")
+        await send_message(writer, build_response("error", "Failed to send invite"))
 
 async def handle_accept_invite(params, username, writer):
-    pass
-    # if len(params) != 1:
-    #     await send_message(writer, build_response("error", "Invalid ACCEPT_INVITE command"))
-    #     return
-    # room_id = params[0]
-    # async with game_rooms_lock:
-    #     if room_id not in game_rooms:
-    #         await send_message(writer, build_response("error", "Room does not exist"))
-    #         return
-    #     room = game_rooms[room_id]
-    #     if room['status'] == 'In Game':
-    #         await send_message(writer, build_response("error", "Room is already in game"))
-    #         return
-    #     if len(room['players']) >= 2:
-    #         await send_message(writer, build_response("error", "Room is full"))
-    #         return
-    #     if username in room['players']:
-    #         await send_message(writer, build_response("error", "You are already in the room"))
-    #         return
-    #     room['players'].append(username)
-    # # Update user's status to "in_game"
-    # async with online_users_lock:
-    #     if username in online_users:
-    #         online_users[username]["status"] = "in_game"
-    # if len(room['players']) == 2:
-    #     async with game_rooms_lock:
-    #         room['status'] = 'In Game'
-    #         # 動態分配 Port
-    #         game_server_port = find_available_port()
-    #         room['game_server_ip'] = config.HOST
-    #         room['game_server_port'] = game_server_port
-    #         # 啟動相應的遊戲伺服器
-    #         if room['game_type'] == 'rock_paper_scissors':
-    #             subprocess.Popen([sys.executable, config.GAME_SERVER_RPS_SCRIPT, config.HOST, str(game_server_port), room_id])
-    #             logger.info(f"啟動 Rock-Paper-Scissors 遊戲伺服器在 {config.HOST}:{game_server_port}，房間ID: {room_id}")
-    #         elif room['game_type'] == 'tictactoe':
-    #             subprocess.Popen([sys.executable, config.GAME_SERVER_TICTACTOE_SCRIPT, config.HOST, str(game_server_port), room_id])
-    #             logger.info(f"啟動 Tic-Tac-Toe 遊戲伺服器在 {config.HOST}:{game_server_port}，房間ID: {room_id}")
-    #     # 發送遊戲伺服器資訊給所有玩家
-    #     game_server_info_message = {
-    #         "status": "game_server_info",
-    #         "room_id": room_id,
-    #         "game_server_ip": room['game_server_ip'],
-    #         "game_server_port": room['game_server_port'],
-    #         "game_type": room['game_type']
-    #     }
-    #     for player in room['players']:
-    #         if player in online_users:
-    #             player_writer = online_users[player]["writer"]
-    #             await send_message(player_writer, json.dumps(game_server_info_message) + '\n')
-    #     logger.info(f"遊戲伺服器資訊已發送給房間內玩家: {room_id}")
-    # await send_message(writer, build_response("success", f"JOIN_ROOM_SUCCESS {room_id} {room['game_type']}"))
-    # # Broadcast updated public rooms list
-    # async with game_rooms_lock:
-    #     public_rooms_data = [
-    #         {
-    #             "room_id": r_id,
-    #             "creator": room["creator"],
-    #             "game_type": room["game_type"],
-    #             "status": room["status"]
-    #         }
-    #         for r_id, room in game_rooms.items()
-    #         if room["type"] == "public" and room["status"] != "In Game"
-    #     ]
-    # public_rooms_message = {
-    #     "status": "update",
-    #     "type": "public_rooms",
-    #     "data": public_rooms_data
-    # }
-    # await broadcast(json.dumps(public_rooms_message) + '\n')
-    # logger.info(f"用戶 {username} 接受邀請加入房間: {room_id}")
+    if len(params) != 1:
+        await send_message(writer, build_response("error", "Invalid ACCEPT_INVITE command"))
+        return
+    room_id = params[0]
+    async with game_rooms_lock:
+        if room_id not in game_rooms:
+            await send_message(writer, build_response("error", "Room does not exist"))
+            return
+        room = game_rooms[room_id]
+        if room['status'] == 'In Game':
+            await send_message(writer, build_response("error", "Room is already in game"))
+            return
+        if len(room['players']) >= 2:
+            await send_message(writer, build_response("error", "Room is full"))
+            return
+        if room['type'] != 'private':
+            await send_message(writer, build_response("error", "Cannot accept invite to a public room"))
+            return
+        if username in room['players']:
+            await send_message(writer, build_response("error", "You are already in the room"))
+            return
+        room['players'].append(username)
+    # Update user's status to "in_room"
+    async with online_users_lock:
+        if username in online_users:
+            online_users[username]["status"] = "in_room"
+    await send_message(writer, build_response("success", f"JOIN_ROOM_SUCCESS {room_id} {room['game_type']}"))
+    
+    # Now, check if we have 2 players and start the game
+    if len(room['players']) == 2:
+        async with game_rooms_lock:
+            room['status'] = 'In Game'
+            game_type = room['game_type']
+            creator = room["players"][0]
+            joiner = username
+            async with online_users_lock:
+                for player in room['players']:
+                    if player in online_users:
+                        online_users[player]["status"] = "in_game"
+                # Retrieve creator and joiner info
+                creator_info = online_users[creator]
+                joiner_info = online_users[joiner]
+                # Generate random ports for each role within the specified range
+                creator_port = get_random_p2p_port()
+                joiner_port = get_random_p2p_port()
+                creator_message = {
+                    "status": "p2p_info",
+                    "role": "host",
+                    "peer_ip": joiner_info["ip"],
+                    "peer_port": joiner_port,
+                    "own_port": creator_port,
+                    "game_type": game_type
+                }
+                joiner_message = {
+                    "status": "p2p_info",
+                    "role": "client",
+                    "peer_ip": creator_info["ip"],
+                    "peer_port": creator_port,
+                    "own_port": joiner_port,
+                    "game_type": game_type
+                }
+                await send_message(creator_info["writer"], json.dumps(creator_message) + '\n')
+                await send_message(joiner_info["writer"], json.dumps(joiner_message) + '\n')
+            logger.info(f"Game server info sent to players in room: {room_id}")
+    # Broadcast updated public rooms list
+    async with game_rooms_lock:
+        public_rooms_data = [
+            {
+                "room_id": r_id,
+                "creator": room["creator"],
+                "game_type": room["game_type"],
+                "status": room["status"]
+            }
+            for r_id, room in game_rooms.items()
+            if room["type"] == "public" and room["status"] != "In Game"
+        ]
+    public_rooms_message = {
+        "status": "update",
+        "type": "public_rooms",
+        "data": public_rooms_data
+    }
+    await broadcast(json.dumps(public_rooms_message) + '\n')
+    logger.info(f"User {username} accepted invite to join room: {room_id}")
+
+async def handle_decline_invite(params, username, writer):
+    if len(params) != 2:
+        await send_message(writer, build_response("error", "Invalid DECLINE_INVITE command"))
+        return
+    inviter_username, room_id = params
+    # Notify the inviter that the invite was declined
+    async with online_users_lock:
+        if inviter_username in online_users:
+            inviter_info = online_users[inviter_username]
+            inviter_writer = inviter_info["writer"]
+            decline_message = {
+                "status": "invite_declined",
+                "from": username,
+                "room_id": room_id
+            }
+            await send_message(inviter_writer, json.dumps(decline_message) + '\n')
+            logger.info(f"User {username} declined invitation from {inviter_username} to room: {room_id}")
+    await send_message(writer, build_response("success", f"DECLINE_INVITE_SUCCESS {room_id}"))
+
 
 async def handle_show_status(writer):
     """處理 SHOW_STATUS 指令，發送格式化的公開房間和在線用戶列表"""
@@ -504,6 +521,60 @@ async def handle_show_status(writer):
     except Exception as e:
         logger.error(f"處理 SHOW_STATUS 時發生錯誤: {e}")
         await send_message(writer, build_response("error", "Failed to retrieve status"))
+
+async def handle_game_over(username):
+    # Update user's status to "idle"
+    async with online_users_lock:
+        if username in online_users:
+            online_users[username]["status"] = "idle"
+
+    room_to_delete = None
+    async with game_rooms_lock:
+        for room_id, room in game_rooms.items():
+            if username in room["players"]:
+                room["players"].remove(username)
+                if len(room["players"]) == 0:
+                    room_to_delete = room_id
+                else:
+                    # If room still has players, update its status to "Waiting"
+                    room["status"] = "Waiting"
+                break
+        if room_to_delete:
+            del game_rooms[room_to_delete]
+
+    # Broadcast updated online users list
+    async with online_users_lock:
+        users_data = [
+            {"username": user, "status": info["status"]}
+            for user, info in online_users.items()
+        ]
+    online_users_message = {
+        "status": "update",
+        "type": "online_users",
+        "data": users_data
+    }
+    await broadcast(json.dumps(online_users_message) + '\n')
+
+    # Broadcast updated public rooms list
+    async with game_rooms_lock:
+        public_rooms_data = [
+            {
+                "room_id": r_id,
+                "creator": room["creator"],
+                "game_type": room["game_type"],
+                "status": room["status"]
+            }
+            for r_id, room in game_rooms.items()
+            if room["type"] == "public" and room["status"] != "In Game"
+        ]
+    public_rooms_message = {
+        "status": "update",
+        "type": "public_rooms",
+        "data": public_rooms_data
+    }
+    await broadcast(json.dumps(public_rooms_message) + '\n')
+
+    logger.info(f"User {username} has ended the game and is now idle.")
 
 async def handle_client(reader, writer):
     """處理每個客戶端連線的函數"""
@@ -563,6 +634,18 @@ async def handle_client(reader, writer):
                     else:
                         await send_message(writer, build_response("error", "Not logged in"))
 
+                elif command == "DECLINE_INVITE":
+                    if username:
+                        await handle_decline_invite(params, username, writer)
+                    else:
+                        await send_message(writer, build_response("error", "Not logged in"))
+
+                elif command == "GAME_OVER":
+                    if username:
+                        await handle_game_over(username)
+                    else:
+                        await send_message(writer, build_response("error", "Not logged in"))
+                
                 elif command == "SHOW_STATUS":
                     if username:
                         await handle_show_status(writer)
@@ -581,29 +664,33 @@ async def handle_client(reader, writer):
         logger.error(f"處理客戶端 {addr} 時發生錯誤: {e}")
     finally:
         if username:
+            user_removed = False
             async with online_users_lock:
                 if username in online_users:
                     del online_users[username]
-            # Broadcast updated online users list
-            users_data = [
-                {"username": user, "status": info["status"]}
-                for user, info in online_users.items()
-            ]
-            online_users_message = {
-                "status": "update",
-                "type": "online_users",
-                "data": users_data
-            }
-            await broadcast(json.dumps(online_users_message) + '\n')
-            logger.info(f"用戶連接斷開: {username}")
+                    user_removed = True
+            if user_removed:
+                # Broadcast updated online users list
+                try:
+                    async with online_users_lock:
+                        users_data = [
+                            {"username": user, "status": info["status"]}
+                            for user, info in online_users.items()
+                        ]
+                    online_users_message = {
+                        "status": "update",
+                        "type": "online_users",
+                        "data": users_data
+                    }
+                    await broadcast(json.dumps(online_users_message) + '\n')
+                    logger.info(f"User disconnected: {username}")
+                except Exception as e:
+                    logger.error(f"Failed to broadcast updated online users list after disconnection: {e}")
         writer.close()
         await writer.wait_closed()
 
-async def main():
-    # 初始化內存中的用戶和房間數據（可選）
-    # 例如，可以預先添加一些用戶或房間
-    # 目前留空
-    
+
+async def main():  
     server = await asyncio.start_server(handle_client, config.HOST, config.PORT)
 
     addr = server.sockets[0].getsockname()

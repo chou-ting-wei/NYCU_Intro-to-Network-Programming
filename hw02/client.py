@@ -1,14 +1,9 @@
-# client.py
-
 import asyncio
 import json
 import sys
-import subprocess
 import logging
-import config  # 確保導入 config 模組
-import platform
+import config
 
-# 設定日誌
 logging.basicConfig(
     filename='client.log',
     filemode='a',
@@ -24,17 +19,16 @@ peer_info = {
     "game_type": None
 }
 
-# 可用的指令列表
 COMMANDS = [
     "REGISTER <username> <password> - 註冊新帳號",
     "LOGIN <username> <password> - 登入帳號",
     "LOGOUT - 登出",
-    "CREATE_ROOM <public/private> <rock_paper_scissors/tictactoe> - 創建房間",
+    "CREATE_ROOM <public/private> <rock_paper_scissors/tictactoe/connectfour> - 創建房間",
     "JOIN_ROOM <room_id> - 加入房間",
     "INVITE_PLAYER <username> <room_id> - 邀請玩家加入房間",
     "EXIT - 離開客戶端",
     "HELP - 顯示可用指令列表",
-    "SHOW_STATUS - 顯示當前狀態"  # 新增 show status 指令
+    "SHOW_STATUS - 顯示當前狀態"
 ]
 
 def build_command(command, params):
@@ -60,7 +54,7 @@ async def send_message(writer, message):
     except Exception as e:
         logging.error(f"發送訊息失敗: {e}")
 
-async def handle_server_messages(reader, writer, game_in_progress):
+async def handle_server_messages(reader, writer, game_in_progress, logged_in):
     """接收伺服器訊息的協程函數"""
     while True:
         try:
@@ -83,9 +77,10 @@ async def handle_server_messages(reader, writer, game_in_progress):
                         print("\n伺服器: REGISTER_SUCCESS")
                     elif msg.startswith("LOGIN_SUCCESS"):
                         print("\n伺服器: LOGIN_SUCCESS")
-                        # 在登入成功後，等待伺服器發送更新訊息
+                        logged_in.value = True
                     elif msg.startswith("LOGOUT_SUCCESS"):
                         print("\n伺服器: LOGOUT_SUCCESS")
+                        logged_in.value = False
                     elif msg.startswith("CREATE_ROOM_SUCCESS"):
                         parts = msg.split()
                         room_id = parts[1]
@@ -100,16 +95,24 @@ async def handle_server_messages(reader, writer, game_in_progress):
                         print(f"\n伺服器: {msg}")
                 elif status == "error":
                     print(f"\n錯誤: {msg}")
+
                 elif status == "invite":
                     inviter = message_json.get("from")
                     room_id = message_json.get("room_id")
-                    response = await get_user_input(f"\n您收到來自 {inviter} 的房間 {room_id} 邀請。是否接受？(yes/no): ")
+                    response = await get_user_input(f"\nYou have received an invitation from {inviter} to join room {room_id}. Accept? (yes/no): ")
                     if response == 'yes':
                         await send_command(writer, "ACCEPT_INVITE", [room_id])
-                        logging.info(f"接受邀請加入房間: {room_id}")
+                        logging.info(f"Accepted invite to join room: {room_id}")
                     else:
-                        print("已拒絕邀請。")
-                        logging.info(f"拒絕邀請加入房間: {room_id}")
+                        await send_command(writer, "DECLINE_INVITE", [inviter, room_id])
+                        print("Invitation declined.")
+                        logging.info(f"Declined invite to join room: {room_id}")
+                elif status == "invite_declined":
+                    decline_from = message_json.get("from")
+                    room_id = message_json.get("room_id")
+                    print(f"\nPlayer {decline_from} declined your invitation to room {room_id}.")
+                    logging.info(f"Player {decline_from} declined invitation to room {room_id}.")
+
                 elif status == "update":
                     update_type = message_json.get("type")
                     if update_type == "online_users":
@@ -130,7 +133,7 @@ async def handle_server_messages(reader, writer, game_in_progress):
                     peer_info["game_type"] = message_json.get("game_type")
                     logging.debug(f"Role: {peer_info['role']}, Peer IP: {peer_info['peer_ip']}, Peer Port: {peer_info['peer_port']}, Own Port: {peer_info['own_port']}, Game Type: {peer_info['game_type']}")
                     print(f"Role: {peer_info['role']}, Peer IP: {peer_info['peer_ip']}, Peer Port: {peer_info['peer_port']}, Own Port: {peer_info['own_port']}")
-                    asyncio.create_task(initiate_game(peer_info["game_type"], game_in_progress))
+                    asyncio.create_task(initiate_game(peer_info["game_type"], game_in_progress, writer))
                     game_in_progress.value = True
                 elif status == "status":
                     print(f"\n{msg}")
@@ -145,7 +148,7 @@ async def handle_server_messages(reader, writer, game_in_progress):
                 game_in_progress.value = False
             break
 
-async def initiate_game(game_type, game_in_progress):
+async def initiate_game(game_type, game_in_progress, writer):
     """Initiates the game based on role and establishes P2P connection."""
     try:
         if game_type is None:
@@ -161,11 +164,17 @@ async def initiate_game(game_type, game_in_progress):
                 await start_tictactoe_game_as_host(peer_info.get("own_port"))
             elif peer_info.get("role") == "client":
                 await start_tictactoe_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
+        elif game_type.lower() == 'connectfour':
+            if peer_info.get("role") == "host":
+                await start_connectfour_game_as_host(peer_info.get("own_port"))
+            elif peer_info.get("role") == "client":
+                await start_connectfour_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
         else:
             logging.error("無效的遊戲類型")
             print("無效的遊戲類型")
     finally:
         game_in_progress.value = False
+        await send_command(writer, "GAME_OVER", [])
 
 ASCII_ART = {
     'rock': '''
@@ -377,35 +386,318 @@ async def get_move(player_name):
 # Tic-Tac-Toe Game Functions
 # -------------------------
 
-async def start_tictactoe_game_as_host(peer_port):
-    print(f"作為 Tic-Tac-Toe 主機等待客戶端連接在 {peer_port}...")
-    # Placeholder for Tic-Tac-Toe server logic
-    # Example: Implement server-specific logic for Tic-Tac-Toe here
-    # You could set up a Tic-Tac-Toe board and manage moves received from the client
+async def start_tictactoe_game_as_host(own_port):
+    """Starts Tic-Tac-Toe game as the host"""
+    server = await asyncio.start_server(handle_tictactoe_client, '0.0.0.0', own_port)
+    logging.info(f"Waiting for client connection at {own_port} as the Tic-Tac-Toe host...")
+    print(f"Waiting for client connection at {own_port} as the Tic-Tac-Toe host...")
 
-async def start_tictactoe_game_as_client(peer_ip, peer_port, room_id):
+    global server_close_event
+    server_close_event = asyncio.Event()
+
+    async def stop_server():
+        await server_close_event.wait()
+        server.close()
+        await server.wait_closed()
+        print("Game server has been shut down.")
+
+    async with server:
+        await asyncio.gather(server.serve_forever(), stop_server())
+
+async def handle_tictactoe_client(reader, writer):
+    """Handles Tic-Tac-Toe game logic for the host"""
     try:
-        print(f"作為 Tic-Tac-Toe 客戶端，連接到主機 {peer_ip}:{peer_port}...")
-        # await asyncio.sleep(2)
-        reader, writer = await asyncio.open_connection(peer_ip, peer_port)
-        print("已連接至主機")
-
-        # Send session token to host for verification
-        session_data = json.dumps({"session_token": room_id})
-        writer.write(session_data.encode())
-        await writer.drain()
-        print("已發送 session token 以進行驗證")
-
-        # Perform game-specific actions for Tic-Tac-Toe
-        # Placeholder for Tic-Tac-Toe client logic
-        # Example: Display and make moves on a Tic-Tac-Toe board
-        
+        print("Tic-Tac-Toe client connected.")
+        await tictactoe_game_loop(reader, writer, "Host")
     except Exception as e:
-        print(f"無法啟動 Tic-Tac-Toe 客戶端模式: {e}")
-        logging.error(f"無法啟動 Tic-Tac-Toe 客戶端模式: {e}")
+        logging.error(f"Tic-Tac-Toe host error: {e}")
     finally:
         writer.close()
         await writer.wait_closed()
+
+async def start_tictactoe_game_as_client(peer_ip, peer_port, max_retries=10, retry_delay=2):
+    writer = None
+    retries = 0
+
+    while retries < max_retries:
+        try:
+            print(f"Connecting to the Tic-Tac-Toe host at {peer_ip}:{peer_port} as a client... (Attempt {retries + 1})")
+            reader, writer = await asyncio.open_connection(peer_ip, peer_port)
+            print("Connected to the host")
+            await tictactoe_game_loop(reader, writer, "Client")
+
+        except ConnectionRefusedError:
+            retries += 1
+            if retries >= max_retries:
+                logging.error(f"Failed to connect after {max_retries} attempts")
+                print(f"Failed to connect after {max_retries} attempts. Exiting...")
+                return
+            else:
+                print(f"Connection refused, retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+
+        except Exception as e:
+            logging.error(f"Failed to start Tic-Tac-Toe client mode: {e}")
+            break
+
+    if writer is not None:
+        writer.close()
+        await writer.wait_closed()
+
+async def tictactoe_game_loop(reader, writer, role):
+    """Main game loop for Tic-Tac-Toe"""
+    board = [' ' for _ in range(9)]
+    my_symbol = 'X' if role == "Host" else 'O'
+    opponent_symbol = 'O' if role == "Host" else 'X'
+    current_turn = 'X'  # 'X' always starts first
+    game_over = False
+
+    while not game_over:
+        display_board(board)
+        if current_turn == my_symbol:
+            move = await get_tictactoe_move(board, my_symbol)
+            board[move] = my_symbol
+            await send_message(writer, {"move": move})
+        else:
+            print("等待對手的移動...")
+            data = await reader.read(1024)
+            if not data:
+                print("對手斷開連接。")
+                game_over = True
+                break
+            message = json.loads(data.decode())
+            move = message.get("move")
+            board[move] = opponent_symbol
+
+        # Check for a winner or a tie
+        if check_winner(board, my_symbol):
+            display_board(board)
+            print(f"玩家 {my_symbol} 獲勝!")
+            game_over = True
+            server_close_event.set()
+        elif check_winner(board, opponent_symbol):
+            display_board(board)
+            print(f"玩家 {opponent_symbol} 獲勝!")
+            game_over = True
+            server_close_event.set()
+        elif ' ' not in board:
+            display_board(board)
+            print("平局!")
+            game_over = True
+            server_close_event.set()
+        else:
+            # Switch turns
+            current_turn = opponent_symbol if current_turn == my_symbol else my_symbol
+
+# def display_board(board):
+#     """Displays the Tic-Tac-Toe board"""
+#     print("\nCurrent Board:")
+#     print(f" {board[0]} | {board[1]} | {board[2]} ")
+#     print("---+---+---")
+#     print(f" {board[3]} | {board[4]} | {board[5]} ")
+#     print("---+---+---")
+#     print(f" {board[6]} | {board[7]} | {board[8]} ")
+#     print("")
+
+def display_board(board):
+    """Displays the Tic-Tac-Toe board with numbers for empty cells"""
+    print("\nCurrent Board:")
+    display = [str(i+1) if cell == ' ' else cell for i, cell in enumerate(board)]
+    print(f" {display[0]} | {display[1]} | {display[2]} ")
+    print("---+---+---")
+    print(f" {display[3]} | {display[4]} | {display[5]} ")
+    print("---+---+---")
+    print(f" {display[6]} | {display[7]} | {display[8]} ")
+    print("")
+
+async def get_tictactoe_move(board, player):
+    """Gets a valid move from the player"""
+    while True:
+        try:
+            move = int(await get_user_input(f"Player {player}, enter your move (1-9): ")) - 1
+            if 0 <= move <= 8 and board[move] == ' ':
+                return move
+            else:
+                print("Invalid move. Try again.")
+        except ValueError:
+            print("Please enter a number between 1 and 9.")
+
+def check_winner(board, player):
+    """Checks if the player has won"""
+    win_conditions = [
+        [0,1,2], [3,4,5], [6,7,8],  # Rows
+        [0,3,6], [1,4,7], [2,5,8],  # Columns
+        [0,4,8], [2,4,6]            # Diagonals
+    ]
+    return any(all(board[pos] == player for pos in condition) for condition in win_conditions)
+
+# -------------------------
+# Connect Four Game Functions
+# -------------------------
+
+async def start_connectfour_game_as_host(own_port):
+    """Starts Connect Four game as the host"""
+    server = await asyncio.start_server(handle_connectfour_client, '0.0.0.0', own_port)
+    logging.info(f"Waiting for client connection at {own_port} as the Connect Four host...")
+    print(f"Waiting for client connection at {own_port} as the Connect Four host...")
+
+    global server_close_event
+    server_close_event = asyncio.Event()
+
+    async def stop_server():
+        await server_close_event.wait()
+        server.close()
+        await server.wait_closed()
+        print("Game server has been shut down.")
+
+    async with server:
+        await asyncio.gather(server.serve_forever(), stop_server())
+
+async def handle_connectfour_client(reader, writer):
+    """Handles Connect Four game logic for the host"""
+    try:
+        print("Connect Four client connected.")
+        await connectfour_game_loop(reader, writer, "Host")
+    except Exception as e:
+        logging.error(f"Connect Four host error: {e}")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+async def start_connectfour_game_as_client(peer_ip, peer_port, max_retries=10, retry_delay=2):
+    """Starts Connect Four game as the client, retrying until the server is ready"""
+    writer = None
+    retries = 0
+
+    while retries < max_retries:
+        try:
+            print(f"Connecting to the Connect Four host at {peer_ip}:{peer_port} as a client... (Attempt {retries + 1})")
+            reader, writer = await asyncio.open_connection(peer_ip, peer_port)
+            print("Connected to the host")
+            await connectfour_game_loop(reader, writer, "Client")
+            break  # Exit the loop if the connection is successful
+
+        except ConnectionRefusedError:
+            retries += 1
+            if retries >= max_retries:
+                logging.error(f"Failed to connect after {max_retries} attempts")
+                print(f"Failed to connect after {max_retries} attempts. Exiting...")
+                return
+            else:
+                print(f"Connection refused, retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+
+        except Exception as e:
+            logging.error(f"Failed to start Connect Four client mode: {e}")
+            break
+
+    if writer is not None:
+        writer.close()
+        await writer.wait_closed()
+
+async def connectfour_game_loop(reader, writer, role):
+    """Main game loop for Connect Four"""
+    board = [[' ' for _ in range(7)] for _ in range(6)]
+    my_symbol = 'X' if role == "Host" else 'O'
+    opponent_symbol = 'O' if role == "Host" else 'X'
+    current_turn = 'X'  # 'X' always starts first
+    game_over = False
+
+    while not game_over:
+        display_connectfour_board(board)
+        if current_turn == my_symbol:
+            column = await get_connectfour_move(board, my_symbol)
+            if column == -1:
+                print("該欄已滿，請選擇另一個欄位。")
+                continue
+            row = place_piece(board, column, my_symbol)
+            await send_message(writer, {"column": column})
+        else:
+            print("等待對手的移動...")
+            data = await reader.read(1024)
+            if not data:
+                print("對手斷開連接。")
+                game_over = True
+                break
+            try:
+                message = json.loads(data.decode())
+                column = message.get("column")
+                if column is not None and 0 <= column <= 6 and board[0][column] == ' ':
+                    row = place_piece(board, column, opponent_symbol)
+                else:
+                    print("收到無效的移動。")
+                    continue
+            except json.JSONDecodeError:
+                print("收到無效的訊息。")
+                continue
+
+        # Check for a winner or a tie
+        if check_connectfour_winner(board, row, column, my_symbol):
+            display_connectfour_board(board)
+            print(f"玩家 {my_symbol} 獲勝!")
+            game_over = True
+            server_close_event.set()
+        elif check_connectfour_winner(board, row, column, opponent_symbol):
+            display_connectfour_board(board)
+            print(f"玩家 {opponent_symbol} 獲勝!")
+            game_over = True
+            server_close_event.set()
+        elif all(board[0][col] != ' ' for col in range(7)):
+            display_connectfour_board(board)
+            print("平局!")
+            game_over = True
+            server_close_event.set()
+        else:
+            # Switch turns
+            current_turn = opponent_symbol if current_turn == my_symbol else my_symbol
+
+def display_connectfour_board(board):
+    """Displays the Connect Four board with column numbers"""
+    print("\nCurrent Board:")
+    for row in board:
+        print('|'.join(row))
+        print('-' * 13)
+    print('0 1 2 3 4 5 6\n')
+
+async def get_connectfour_move(board, player):
+    """Gets a valid column from the player"""
+    while True:
+        try:
+            column_input = await get_user_input(f"Player {player}, enter column (0-6): ")
+            column = int(column_input)
+            if 0 <= column <= 6 and board[0][column] == ' ':
+                return column
+            else:
+                print("Invalid column. Try again.")
+        except ValueError:
+            print("Please enter a number between 0 and 6.")
+
+def place_piece(board, column, player):
+    """Places a piece in the chosen column and returns the row index"""
+    for row in reversed(range(6)):
+        if board[row][column] == ' ':
+            board[row][column] = player
+            return row
+    print("該欄已滿。")
+    return -1  # Indicates the column is full
+
+def check_connectfour_winner(board, row, column, player):
+    """Checks if the player has won in Connect Four"""
+    directions = [(0,1), (1,0), (1,1), (1,-1)]  # Horizontal, Vertical, Diagonal /
+    for dx, dy in directions:
+        count = 1
+        for dir in [1, -1]:
+            x, y = row, column
+            while True:
+                x += dir * dx
+                y += dir * dy
+                if 0 <= x < 6 and 0 <= y < 7 and board[x][y] == player:
+                    count += 1
+                else:
+                    break
+        if count >= 4:
+            return True
+    return False
 
 def display_online_users(online_users):
     """顯示在線用戶列表"""
@@ -438,12 +730,11 @@ async def get_user_input(prompt):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: input(prompt).strip().lower())
 
-async def handle_user_input(writer, game_in_progress):
+async def handle_user_input(writer, game_in_progress, logged_in):
     """處理用戶輸入的協程函數"""
     while True:
         try:
             if game_in_progress.value:
-                # 遊戲進行中，不接受其他指令
                 await asyncio.sleep(0.1)
                 continue
             user_input = await get_user_input("輸入指令: ")
@@ -466,8 +757,8 @@ async def handle_user_input(writer, game_in_progress):
                 print("\n可用的指令:")
                 for cmd in COMMANDS:
                     print(cmd)
-                print("")  # 空行
-                continue  # 不發送到伺服器
+                print("")
+                continue
 
             elif command == "REGISTER":
                 if len(params) != 2:
@@ -482,8 +773,10 @@ async def handle_user_input(writer, game_in_progress):
                 await send_command(writer, "LOGIN", params)
 
             elif command == "LOGOUT":
+                if not logged_in.value:
+                    print("Not logged in.")
+                    continue
                 await send_command(writer, "LOGOUT", [])
-                # 此處不設置 username，因為伺服器會處理
 
             elif command == "CREATE_ROOM":
                 if len(params) != 2:
@@ -525,14 +818,14 @@ async def handle_user_input(writer, game_in_progress):
             break
 
 async def main():
-    server_ip = input("輸入伺服器 IP (預設: 127.0.0.1): ").strip()
-    server_ip = server_ip if server_ip else '127.0.0.1'
-    server_port_input = input("輸入伺服器 port (預設: 15000): ").strip()
+    server_ip = input(f"輸入伺服器 IP (預設: {config.HOST}): ").strip()
+    server_ip = server_ip if server_ip else config.HOST
+    server_port_input = input(f"輸入伺服器 port (預設: {config.PORT}): ").strip()
     try:
-        server_port = int(server_port_input) if server_port_input else 15000
+        server_port = int(server_port_input) if server_port_input else config.PORT
     except ValueError:
         print("無效的 port 輸入。使用預設 port 15000。")
-        server_port = 15000
+        server_port = config.PORT
 
     try:
         reader, writer = await asyncio.open_connection(server_ip, server_port)
@@ -547,10 +840,11 @@ async def main():
         logging.error(f"無法連接到伺服器: {e}")
         return
 
-    game_in_progress = type('', (), {'value': False})() 
+    game_in_progress = type('', (), {'value': False})()
+    logged_in = type('', (), {'value': False})()
 
-    asyncio.create_task(handle_server_messages(reader, writer, game_in_progress))
-    asyncio.create_task(handle_user_input(writer, game_in_progress))
+    asyncio.create_task(handle_server_messages(reader, writer, game_in_progress, logged_in))
+    asyncio.create_task(handle_user_input(writer, game_in_progress, logged_in))
 
     # 顯示可用指令列表一次
     print("\n可用的指令:")
@@ -559,7 +853,7 @@ async def main():
     print("")  # 空行
 
     # 等待停止事件
-    await asyncio.Future()  # 保持事件迴圈運行，直到手動關閉
+    await asyncio.Future()
 
     print("客戶端已關閉。")
     logging.info("客戶端已關閉。")
