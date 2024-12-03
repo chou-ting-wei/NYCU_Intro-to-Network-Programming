@@ -3,6 +3,10 @@ import json
 import sys
 import logging
 import config
+import os
+import hashlib
+import aiofiles
+import aiofiles.os
 
 logging.basicConfig(
     filename='client.log',
@@ -16,7 +20,7 @@ peer_info = {
     "peer_ip": None,
     "peer_port": None,
     "own_port": None,
-    "game_type": None
+    "game_name": None
 }
 
 COMMAND_ALIASES = {
@@ -31,7 +35,9 @@ COMMAND_ALIASES = {
     "SHOW_STATUS": ["SHOW_STATUS", "status", "s"],
     "MANAGE_INVITES": ["INV", "inv"],
     "LEAVE_ROOM": ["LEAVE_ROOM", "leave"],
-    "START_GAME": ["START_GAME", "start", "st"]
+    "START_GAME": ["START_GAME", "start", "st"],
+    "UPLOAD_GAME": ["UPLOAD_GAME", "upload_game", "ug"],
+    "LIST_OWN_GAMES": ["LIST_OWN_GAMES", "list_games", "lg"],
 }
 
 COMMANDS = [
@@ -43,13 +49,41 @@ COMMANDS = [
     "invite <使用者名稱> <房間ID> - 邀請玩家加入房間",
     "start - 開始遊戲（房主專用）",
     "leave - 離開當前房間",
-    "inv - 查看和管理您的邀請"
+    "inv - 查看和管理您的邀請",
+    "upload_game <game_file_name> - 上傳遊戲文件",
+    "list_games - 列出自己發布的遊戲",
     "exit - 離開客戶端",
     "help - 顯示可用指令列表",
-    "status - 顯示當前狀態"
+    "status - 顯示當前狀態",
 ]
 
 pending_invitations = []
+username = None
+user_folder = None
+pending_uploads = {}
+pending_upload_confirms = {}
+pending_downloads = {}
+room_info = {}
+
+def get_username_hash(username):
+    return hashlib.sha256(username.encode()).hexdigest()[:8] 
+
+async def setup_user_directory(username):
+    global user_folder
+    username_hash = get_username_hash(username)
+    user_folder = f"games-{username_hash}"
+    try:
+        if not await aiofiles.os.path.exists(user_folder):
+            await aiofiles.os.makedirs(user_folder)
+            print(f"已創建資料夾：{user_folder}")
+            logging.info(f"已創建資料夾：{user_folder}")
+        else:
+            print(f"資料夾已存在：{user_folder}")
+            logging.info(f"資料夾已存在：{user_folder}")
+    except Exception as e:
+        print(f"設定用戶資料夾時發生錯誤：{e}")
+        logging.error(f"設定用戶資料夾時發生錯誤：{e}")
+    return user_folder
 
 def build_command(command, params):
     return json.dumps({"command": command.upper(), "params": params}) + '\n'
@@ -69,7 +103,7 @@ async def send_command(writer, command, params):
 
 async def send_message(writer, message):
     try:
-        data = json.dumps(message).encode()
+        data = (json.dumps(message) + '\n').encode()
         writer.write(data)
         await writer.drain()
     except Exception as e:
@@ -98,20 +132,40 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                     elif msg.startswith("LOGIN_SUCCESS"):
                         print("\n伺服器：登入成功。")
                         logged_in.value = True
+                        parts = msg.split()
+                        if len(parts) >= 2:
+                            username = parts[1]
+                            await setup_user_directory(username)
                     elif msg.startswith("LOGOUT_SUCCESS"):
                         print("\n伺服器：登出成功。")
                         logged_in.value = False
                     elif msg.startswith("CREATE_ROOM_SUCCESS"):
                         parts = msg.split()
                         room_id = parts[1]
-                        game_type = parts[2] if len(parts) > 2 else 'rps'
-                        print(f"\n伺服器：房間創建成功，ID：{room_id}，遊戲類型：{game_type}")
+                        game_name = parts[2] if len(parts) > 2 else 'unknown'
+                        print(f"\n伺服器：房間創建成功，ID：{room_id}，遊戲類型：{game_name}")
                     elif msg.startswith("JOIN_ROOM_SUCCESS"):
                         parts = msg.split()
                         room_id = parts[1]
-                        game_type = parts[2] if len(parts) > 2 else 'rps'
-                        print(f"\n伺服器：成功加入房間，ID：{room_id}，遊戲類型：{game_type}")
+                        game_name = parts[2] if len(parts) > 2 else 'unknown'
+                        print(f"\n伺服器：成功加入房間，ID：{room_id}，遊戲名稱：{game_name}")
                     elif msg.startswith("INVITE_SENT"):
+                        print(f"\n伺服器：{msg}")
+                    elif msg.startswith("UPLOAD_GAME_SUCCESS"):
+                        game_name = message_json.get('game_name')
+                        if game_name in pending_upload_confirms:
+                            pending_upload_confirms[game_name].set_result(True)
+                            # del pending_upload_confirms[game_name]
+                        # print(f"遊戲 {game_name} 上傳成功。")
+                    elif 'games' in message_json:
+                        logging.info("收到遊戲列表。")
+                        # logging.debug(f"遊戲列表：{message_json['games']}")
+                        games_list = message_json['games']
+                        print("\n您的遊戲列表：")
+                        for game in games_list:
+                            print(f"遊戲名稱：{game['name']}，描述：{game['description']}，版本：{game['version']}")
+                    else:
+                        msg = message_json.get("message", "")
                         print(f"\n伺服器：{msg}")
                 elif status == "error":
                     print(f"\n錯誤：{msg}")
@@ -126,30 +180,40 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                     elif event == "room_created":
                         room_id = message_json.get("room_id")
                         creator = message_json.get("creator")
-                        game_type = message_json.get("game_type")
+                        game_name = message_json.get("game_name")
                         room_type = message_json.get("room_type")
-                        print(f"\n[系統通知] 玩家 {creator} 創建了 {'公開' if room_type == 'public' else '私人'} 房間 {room_id}，遊戲類型：{game_type}")
+                        print(f"\n[系統通知] 玩家 {creator} 創建了 {'公開' if room_type == 'public' else '私人'} 房間 {room_id}，遊戲類型：{game_name}")
+                        room_info[room_id] = game_name
 
                 elif status == "invite":
                     inviter = message_json.get("from")
                     room_id = message_json.get("room_id")
                     invitation = {"inviter": inviter, "room_id": room_id}
                     pending_invitations.append(invitation)
+                    game_name = message_json.get("game_name", "未知")
+                    room_info[room_id] = game_name
                     print(f"\n[邀請通知] 您收到來自 {inviter} 的房間 {room_id} 邀請。使用 'inv' 指令來查看和管理您的邀請。")
-                    # response = await get_user_input(f"\n您收到來自 {inviter} 的邀請，加入房間 {room_id}。接受嗎？(yes/no)：")
-                    # if response == 'yes':
-                    #     await send_command(writer, "ACCEPT_INVITE", [room_id])
-                    #     logging.info(f"接受邀請加入房間：{room_id}")
-                    # else:
-                    #     await send_command(writer, "DECLINE_INVITE", [inviter, room_id])
-                    #     print("已拒絕邀請。")
-                    #     logging.info(f"拒絕邀請加入房間：{room_id}")
+
                 elif status == "invite_declined":
                     decline_from = message_json.get("from")
                     room_id = message_json.get("room_id")
                     print(f"\n玩家 {decline_from} 拒絕了您對房間 {room_id} 的邀請。")
                     logging.info(f"玩家 {decline_from} 拒絕邀請加入房間 {room_id}。")
 
+                elif status == "file_transfer":
+                    game_name = message_json.get("game_name")
+                    file_size = int(message_json.get("file_size"))
+                    if game_name in pending_downloads:
+                        file_content = await reader.readexactly(file_size)
+                        file_path = os.path.join(user_folder, game_name + ".py")
+                        async with aiofiles.open(file_path, 'wb') as f:
+                            await f.write(file_content)
+                        pending_downloads[game_name].set_result(file_content)
+                        del pending_downloads[game_name]
+                        print(f"已下載遊戲檔案 {game_name}.py")
+                    else:
+                        print("收到未知的文件傳輸。")
+            
                 elif status == "update":
                     update_type = message_json.get("type")
                     if update_type == "online_users":
@@ -167,10 +231,10 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                     peer_info["peer_ip"] = message_json.get("peer_ip")
                     peer_info["peer_port"] = message_json.get("peer_port")
                     peer_info["own_port"] = message_json.get("own_port")
-                    peer_info["game_type"] = message_json.get("game_type")
-                    logging.debug(f"角色：{peer_info['role']}，對等方 IP：{peer_info['peer_ip']}，對等方 Port：{peer_info['peer_port']}，自身 Port：{peer_info['own_port']}，遊戲類型：{peer_info['game_type']}")
+                    peer_info["game_name"] = message_json.get("game_name")
+                    logging.debug(f"角色：{peer_info['role']}，對等方 IP：{peer_info['peer_ip']}，對等方 Port：{peer_info['peer_port']}，自身 Port：{peer_info['own_port']}，遊戲類型：{peer_info['game_name']}")
                     print(f"角色：{peer_info['role']}，對等方 IP：{peer_info['peer_ip']}，對等方 Port：{peer_info['peer_port']}，自身 Port：{peer_info['own_port']}")
-                    asyncio.create_task(initiate_game(peer_info["game_type"], game_in_progress, writer))
+                    asyncio.create_task(initiate_game(peer_info["game_name"], game_in_progress, writer))
                     game_in_progress.value = True
                 elif status == "host_transfer":
                     new_host = message_json.get("new_host")
@@ -179,6 +243,12 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                         print(f"\n[系統通知] 您已成為房間 {room_id} 的新房主。")
                     else:
                         print(f"\n[系統通知] 玩家 {new_host} 現在是房間 {room_id} 的房主。")
+                
+                elif status == "ready":
+                    game_name = message_json.get('game_name')
+                    if game_name in pending_uploads:
+                        pending_uploads[game_name].set_result(True)
+                        del pending_uploads[game_name]                
                 elif status == "status":
                     print(f"\n{msg}")
                 elif status == "info":
@@ -195,6 +265,11 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                         room_id = message_json.get("room_id")
                         status_update = message_json.get("status")
                         print(f"\n房間 {room_id} 狀態更新為 {status_update}")
+                elif status == "lobby_info":
+                    public_rooms = message_json.get("public_rooms", [])
+                    online_users = message_json.get("online_users", [])
+                    display_public_rooms(public_rooms)
+                    display_online_users(online_users)
                 else:
                     print(f"\n伺服器：{message}")
             except json.JSONDecodeError:
@@ -206,493 +281,58 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                 game_in_progress.value = False
             break
 
-async def initiate_game(game_type, game_in_progress, writer):
+async def initiate_game(game_name, game_in_progress, writer):
     try:
-        if game_type is None:
-            raise ValueError("game_type 未定義")
-        
-        if game_type.lower() == 'rps' or game_type.lower() == 'rock_paper_scissors':
-            if peer_info.get("role") == "host":
-                await start_rps_game_as_host(peer_info.get("own_port"))
-            elif peer_info.get("role") == "client":
-                await start_rps_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
-        elif game_type.lower() == 'ttt' or game_type.lower() == 'tictactoe':
-            if peer_info.get("role") == "host":
-                await start_tictactoe_game_as_host(peer_info.get("own_port"))
-            elif peer_info.get("role") == "client":
-                await start_tictactoe_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
-        elif game_type.lower() == 'c4' or game_type.lower() == 'connectfour':
-            if peer_info.get("role") == "host":
-                await start_connectfour_game_as_host(peer_info.get("own_port"))
-            elif peer_info.get("role") == "client":
-                await start_connectfour_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
-        else:
-            logging.error("無效的遊戲類型")
-            print("無效的遊戲類型")
+        game_folder = 'games'
+        file_path = os.path.join(game_folder, game_name + ".py")
+        print(f"正在執行遊戲 {game_name}...")
+        if not os.path.exists(file_path):
+            print(f"遊戲檔案 {game_name} 不存在。")
+            return
+        game_globals = {}   
+        game_globals['peer_info'] = peer_info
+        try:
+            async with aiofiles.open(file_path, 'r') as f:
+                code = await f.read()
+            exec(code, game_globals)
+            if 'main' in game_globals and callable(game_globals['main']):
+                await game_globals['main']()
+            else:
+                print("遊戲腳本不包含 main() 函數。")
+        except Exception as e:
+            print(f"讀取或執行遊戲腳本時發生錯誤：{e}")
+            logging.error(f"讀取或執行遊戲腳本時發生錯誤：{e}")
+    except Exception as e:
+        print(f"遊戲執行時發生錯誤：{e}")
+        logging.error(f"遊戲執行時發生錯誤：{e}")
     finally:
         game_in_progress.value = False
         await send_command(writer, "GAME_OVER", [])
-
-ASCII_ART = {
-    'rock': '''
-        _______
-    ---'   ____)
-          (_____)
-          (_____)
-          (____)
-    ---.__(___)
-    ''',
-    'paper': '''
-         _______
-    ---'    ____)____
-               ______)
-              _______)
-             _______)
-    ---.__________)
-    ''',
-    'scissors': '''
-        _______
-    ---'   ____)____
-              ______)
-           __________)
-          (____)
-    ---.__(___)
-    '''
-}
-
-VALID_MOVES = ['rock', 'paper', 'scissors']
-
-# -------------------------
-# Rock-Paper-Scissors (RPS) 遊戲函數
-# -------------------------
-
-async def start_rps_game_as_host(own_port):
-    server = await asyncio.start_server(handle_rps_client, '0.0.0.0', own_port)
-    logging.info(f"等待客戶端連接於 {own_port} 作為 RPS 主機...")
-    print(f"等待客戶端連接於 {own_port} 作為 RPS 主機...")
-    
-    global server_close_event
-    server_close_event = asyncio.Event()
-
-    async def stop_server():
-        await server_close_event.wait()
-        server.close()
-        await server.wait_closed()
-        print("遊戲伺服器已關閉。")
-
-    async with server:
-        await asyncio.gather(server.serve_forever(), stop_server())
-
-async def handle_rps_client(reader, writer):
-    try:
-        print("RPS 客戶端已連接。")
-        await rps_game_loop(reader, writer, "Host")
-    except Exception as e:
-        logging.error(f"RPS 主機錯誤：{e}")
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-async def start_rps_game_as_client(peer_ip, peer_port, max_retries=10, retry_delay=2):
-    writer = None
-    retries = 0
-
-    while retries < max_retries:
-        try:
-            print(f"正在連接到 {peer_ip}:{peer_port} 的 RPS 主機作為客戶端...（嘗試 {retries + 1}）")
-            reader, writer = await asyncio.open_connection(peer_ip, peer_port)
-            print("已成功連接到主機。")
-            await rps_game_loop(reader, writer, "Client")
-            break
-
-        except ConnectionRefusedError:
-            retries += 1
-            if retries >= max_retries:
-                logging.error(f"嘗試 {max_retries} 次後連接失敗。")
-                print(f"嘗試 {max_retries} 次後連接失敗。正在退出...")
-                return
-            else:
-                print(f"連接被拒絕，{retry_delay} 秒後重試...")
-                await asyncio.sleep(retry_delay)
-
-        except Exception as e:
-            logging.error(f"啟動 RPS 客戶端模式時失敗：{e}")
-            break
-
-    if writer is not None:
-        writer.close()
-        await writer.wait_closed()
-
-async def rps_game_loop(reader, writer, role):
-    my_move = None
-    opponent_move = None
-    game_over = False
-
-    while not game_over:
-        if role == "Host":
-            # Host move
-            my_move = await get_rps_move("Host")
-            await send_message(writer, {"move": my_move})
-            print("等待對手的移動...")
-            data = await reader.read(1024)
-            if not data:
-                print("對手已斷開連接。")
-                game_over = True
-                break
-            try:
-                message = json.loads(data.decode())
-                opponent_move = message.get("move")
-                if opponent_move not in VALID_MOVES:
-                    print("收到無效的移動。")
-                    continue
-            except json.JSONDecodeError:
-                print("收到無效的訊息。")
-                continue
-        else:
-            # Client move
-            print("等待對手的移動...")
-            data = await reader.read(1024)
-            if not data:
-                print("對手已斷開連接。")
-                game_over = True
-                break
-            try:
-                message = json.loads(data.decode())
-                opponent_move = message.get("move")
-                if opponent_move not in VALID_MOVES:
-                    print("收到無效的移動。")
-                    continue
-            except json.JSONDecodeError:
-                print("收到無效的訊息。")
-                continue
-            my_move = await get_rps_move("Client")
-            await send_message(writer, {"move": my_move})
-
-        result = determine_rps_winner(my_move, opponent_move, role)
-        display_rps_result(my_move, opponent_move, result, role)
-        game_over = True
-        server_close_event.set()
-
-async def get_rps_move(player):
-    while True:
-        move = await get_user_input(f"玩家 {player}，請選擇 rock、paper 或 scissors：")
-        move = move.strip().lower()
-        if move in VALID_MOVES:
-            print(ASCII_ART.get(move, ''))
-            return move
-        else:
-            print("無效的選擇，請再試一次。")
-
-def determine_rps_winner(my_move, opponent_move, role):
-    if my_move == opponent_move:
-        return "平局"
-    elif (my_move == 'rock' and opponent_move == 'scissors') or \
-         (my_move == 'paper' and opponent_move == 'rock') or \
-         (my_move == 'scissors' and opponent_move == 'paper'):
-        return f"玩家 {role} 獲勝"
-    else:
-        return f"玩家 {'Client' if role == 'Host' else 'Host'} 獲勝"
-
-def display_rps_result(my_move, opponent_move, result, role):
-    print("\n=== 遊戲結果 ===")
-    print(f"您的移動：{my_move}")
-    print(ASCII_ART.get(my_move, ''))
-    print(f"對手的移動：{opponent_move}")
-    print(ASCII_ART.get(opponent_move, ''))
-    print(f"結果：{result}")
-    print("================")
-
-# -------------------------
-# Tic-Tac-Toe (TTT) 遊戲函數
-# -------------------------
-
-async def start_tictactoe_game_as_host(own_port):
-    server = await asyncio.start_server(handle_tictactoe_client, '0.0.0.0', own_port)
-    logging.info(f"等待客戶端連接於 {own_port} 作為 Tic-Tac-Toe 主機...")
-    print(f"等待客戶端連接於 {own_port} 作為 Tic-Tac-Toe 主機...")
-    
-    global server_close_event
-    server_close_event = asyncio.Event()
-
-    async def stop_server():
-        await server_close_event.wait()
-        server.close()
-        await server.wait_closed()
-        print("遊戲伺服器已關閉。")
-
-    async with server:
-        await asyncio.gather(server.serve_forever(), stop_server())
-
-async def handle_tictactoe_client(reader, writer):
-    try:
-        print("Tic-Tac-Toe 客戶端已連接。")
-        await tictactoe_game_loop(reader, writer, "Host")
-    except Exception as e:
-        logging.error(f"Tic-Tac-Toe 主機錯誤：{e}")
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-async def start_tictactoe_game_as_client(peer_ip, peer_port, max_retries=10, retry_delay=2):
-    writer = None
-    retries = 0
-
-    while retries < max_retries:
-        try:
-            print(f"正在連接到 {peer_ip}:{peer_port} 的 Tic-Tac-Toe 主機作為客戶端...（嘗試 {retries + 1}）")
-            reader, writer = await asyncio.open_connection(peer_ip, peer_port)
-            print("已成功連接到主機。")
-            await tictactoe_game_loop(reader, writer, "Client")
-            break
-
-        except ConnectionRefusedError:
-            retries += 1
-            if retries >= max_retries:
-                logging.error(f"嘗試 {max_retries} 次後連接失敗。")
-                print(f"嘗試 {max_retries} 次後連接失敗。正在退出...")
-                return
-            else:
-                print(f"連接被拒絕，{retry_delay} 秒後重試...")
-                await asyncio.sleep(retry_delay)
-
-        except Exception as e:
-            logging.error(f"啟動 Tic-Tac-Toe 客戶端模式時失敗：{e}")
-            break
-
-    if writer is not None:
-        writer.close()
-        await writer.wait_closed()
-
-async def tictactoe_game_loop(reader, writer, role):
-    board = [' ' for _ in range(9)]
-    my_symbol = 'X' if role == "Host" else 'O'
-    opponent_symbol = 'O' if role == "Host" else 'X'
-    current_turn = 'X'  # 'X' moves first
-    game_over = False
-
-    while not game_over:
-        display_board(board)
-        if current_turn == my_symbol:
-            move = await get_tictactoe_move(board, my_symbol)
-            board[move] = my_symbol
-            await send_message(writer, {"move": move})
-        else:
-            print("等待對手的移動...")
-            data = await reader.read(1024)
-            if not data:
-                print("對手已斷開連接。")
-                game_over = True
-                break
-            message = json.loads(data.decode())
-            move = message.get("move")
-            board[move] = opponent_symbol
-
-        if check_winner(board, my_symbol):
-            display_board(board)
-            print(f"玩家 {my_symbol} 獲勝!")
-            game_over = True
-            server_close_event.set()
-        elif check_winner(board, opponent_symbol):
-            display_board(board)
-            print(f"玩家 {opponent_symbol} 獲勝!")
-            game_over = True
-            server_close_event.set()
-        elif ' ' not in board:
-            display_board(board)
-            print("平局!")
-            game_over = True
-            server_close_event.set()
-        else:
-            # Switch turns
-            current_turn = opponent_symbol if current_turn == my_symbol else my_symbol
-
-def display_board(board):
-    print("\n當前棋盤：")
-    display = [str(i+1) if cell == ' ' else cell for i, cell in enumerate(board)]
-    print(f" {display[0]} | {display[1]} | {display[2]} ")
-    print("---+---+---")
-    print(f" {display[3]} | {display[4]} | {display[5]} ")
-    print("---+---+---")
-    print(f" {display[6]} | {display[7]} | {display[8]} ")
-    print("")
-
-async def get_tictactoe_move(board, player):
-    while True:
-        try:
-            move = int(await get_user_input(f"玩家 {player}，請輸入您的移動 (1-9)：")) - 1
-            if 0 <= move <= 8 and board[move] == ' ':
-                return move
-            else:
-                print("無效的移動，請再試一次。")
-        except ValueError:
-            print("請輸入 1 到 9 之間的數字。")
-
-def check_winner(board, player):
-    win_conditions = [
-        [0,1,2], [3,4,5], [6,7,8],  # rows
-        [0,3,6], [1,4,7], [2,5,8],  # columns
-        [0,4,8], [2,4,6]            # diagonals
-    ]
-    return any(all(board[pos] == player for pos in condition) for condition in win_conditions)
-
-# -------------------------
-# Connect Four (C4) 遊戲函數
-# -------------------------
-
-async def start_connectfour_game_as_host(own_port):
-    server = await asyncio.start_server(handle_connectfour_client, '0.0.0.0', own_port)
-    logging.info(f"等待客戶端連接於 {own_port} 作為 Connect Four 主機...")
-    print(f"等待客戶端連接於 {own_port} 作為 Connect Four 主機...")
-    
-    global server_close_event
-    server_close_event = asyncio.Event()
-
-    async def stop_server():
-        await server_close_event.wait()
-        server.close()
-        await server.wait_closed()
-        print("遊戲伺服器已關閉。")
-
-    async with server:
-        await asyncio.gather(server.serve_forever(), stop_server())
-
-async def handle_connectfour_client(reader, writer):
-    try:
-        print("Connect Four 客戶端已連接。")
-        await connectfour_game_loop(reader, writer, "Host")
-    except Exception as e:
-        logging.error(f"Connect Four 主機錯誤：{e}")
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-async def start_connectfour_game_as_client(peer_ip, peer_port, max_retries=10, retry_delay=2):
-    writer = None
-    retries = 0
-
-    while retries < max_retries:
-        try:
-            print(f"正在連接到 {peer_ip}:{peer_port} 的 Connect Four 主機作為客戶端...（嘗試 {retries + 1}）")
-            reader, writer = await asyncio.open_connection(peer_ip, peer_port)
-            print("已成功連接到主機。")
-            await connectfour_game_loop(reader, writer, "Client")
-            break
-
-        except ConnectionRefusedError:
-            retries += 1
-            if retries >= max_retries:
-                logging.error(f"嘗試 {max_retries} 次後連接失敗。")
-                print(f"嘗試 {max_retries} 次後連接失敗。正在退出...")
-                return
-            else:
-                print(f"連接被拒絕，{retry_delay} 秒後重試...")
-                await asyncio.sleep(retry_delay)
-
-        except Exception as e:
-            logging.error(f"啟動 Connect Four 客戶端模式時失敗：{e}")
-            break
-
-    if writer is not None:
-        writer.close()
-        await writer.wait_closed()
-
-async def connectfour_game_loop(reader, writer, role):
-    board = [[' ' for _ in range(7)] for _ in range(6)]
-    my_symbol = 'X' if role == "Host" else 'O'
-    opponent_symbol = 'O' if role == "Host" else 'X'
-    current_turn = 'X'  # 'X' 總是先手
-    game_over = False
-
-    while not game_over:
-        display_connectfour_board(board)
-        if current_turn == my_symbol:
-            column = await get_connectfour_move(board, my_symbol)
-            if column == -1:
-                print("該欄已滿，請選擇另一個欄位。")
-                continue
-            row = place_piece(board, column, my_symbol)
-            await send_message(writer, {"column": column})
-        else:
-            print("等待對手的移動...")
-            data = await reader.read(1024)
-            if not data:
-                print("對手已斷開連接。")
-                game_over = True
-                break
-            try:
-                message = json.loads(data.decode())
-                column = message.get("column")
-                if column is not None and 0 <= column <= 6 and board[0][column] == ' ':
-                    row = place_piece(board, column, opponent_symbol)
-                else:
-                    print("收到無效的移動。")
-                    continue
-            except json.JSONDecodeError:
-                print("收到無效的訊息。")
-                continue
-
-        if check_connectfour_winner(board, row, column, my_symbol):
-            display_connectfour_board(board)
-            print(f"玩家 {my_symbol} 獲勝!")
-            game_over = True
-            server_close_event.set()
-        elif check_connectfour_winner(board, row, column, opponent_symbol):
-            display_connectfour_board(board)
-            print(f"玩家 {opponent_symbol} 獲勝!")
-            game_over = True
-            server_close_event.set()
-        elif all(board[0][col] != ' ' for col in range(7)):
-            display_connectfour_board(board)
-            print("平局!")
-            game_over = True
-            server_close_event.set()
-        else:
-            # Switch turns
-            current_turn = opponent_symbol if current_turn == my_symbol else my_symbol
-
-def display_connectfour_board(board):
-    print("\n當前棋盤：")
-    for row in board:
-        print('|'.join(row))
-        print('-' * 13)
-    print('0 1 2 3 4 5 6\n')
-
-async def get_connectfour_move(board, player):
-    while True:
-        try:
-            column_input = await get_user_input(f"玩家 {player}，請輸入要放置的列號 (0-6)：")
-            column = int(column_input)
-            if 0 <= column <= 6 and board[0][column] == ' ':
-                return column
-            else:
-                print("無效的列號，請再試一次。")
-        except ValueError:
-            print("請輸入 0 到 6 之間的數字。")
-
-def place_piece(board, column, player):
-    for row in reversed(range(6)):
-        if board[row][column] == ' ':
-            board[row][column] = player
-            return row
-    print("該欄已滿。")
-    return -1  # Invalid move
-
-def check_connectfour_winner(board, row, column, player):
-    directions = [(0,1), (1,0), (1,1), (1,-1)]
-    for dx, dy in directions:
-        count = 1
-        for dir in [1, -1]:
-            x, y = row, column
-            while True:
-                x += dir * dx
-                y += dir * dy
-                if 0 <= x < 6 and 0 <= y < 7 and board[x][y] == player:
-                    count += 1
-                else:
-                    break
-        if count >= 4:
-            return True
-    return False
+    # try:
+    #     if game_name is None:
+    #         raise ValueError("game_name 未定義")
+        
+    #     if game_name.lower() == 'rps' or game_name.lower() == 'rock_paper_scissors':
+    #         if peer_info.get("role") == "host":
+    #             await start_rps_game_as_host(peer_info.get("own_port"))
+    #         elif peer_info.get("role") == "client":
+    #             await start_rps_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
+    #     elif game_name.lower() == 'ttt' or game_name.lower() == 'tictactoe':
+    #         if peer_info.get("role") == "host":
+    #             await start_tictactoe_game_as_host(peer_info.get("own_port"))
+    #         elif peer_info.get("role") == "client":
+    #             await start_tictactoe_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
+    #     elif game_name.lower() == 'c4' or game_name.lower() == 'connectfour':
+    #         if peer_info.get("role") == "host":
+    #             await start_connectfour_game_as_host(peer_info.get("own_port"))
+    #         elif peer_info.get("role") == "client":
+    #             await start_connectfour_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
+    #     else:
+    #         logging.error("無效的遊戲類型")
+    #         print("無效的遊戲類型")
+    # finally:
+    #     game_in_progress.value = False
+    #     await send_command(writer, "GAME_OVER", [])
 
 def display_online_users(online_users):
     print("\n=== 在線用戶列表 ===")
@@ -705,25 +345,27 @@ def display_online_users(online_users):
             print(f"玩家：{name} - 狀態：{status}")
     print("=====================")
 
-def display_public_rooms(public_rooms):
+def display_public_rooms(rooms):
     print("\n=== 公開房間列表 ===")
-    if not public_rooms:
+    if not rooms:
         print("無公開房間等待玩家。")
     else:
-        for room in public_rooms:
+        for room in rooms:
             room_id = room.get("room_id", "未知")
             creator = room.get("creator", "未知")
-            game_type = room.get("game_type", "未知")
+            game_name = room.get("game_name", "未知")
             room_status = room.get("status", "未知")
             room_host = room.get("host", "未知")
-            print(f"房間 ID：{room_id} | 創建者：{creator} | 房主：{room_host} | 遊戲類型：{game_type} | 狀態：{room_status}")
+            room_type = room.get("type", "未知")
+            print(f"房間 ID：{room_id} | 類型：{room_type} | 創建者：{creator} | 房主：{room_host} | 遊戲類型：{game_name} | 狀態：{room_status}")
+            room_info[room_id] = game_name
     print("=====================")
 
 async def get_user_input(prompt):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: input(prompt).strip().lower())
 
-async def handle_user_input(writer, game_in_progress, logged_in):
+async def handle_user_input(reader, writer, game_in_progress, logged_in):
     while True:
         try:
             if game_in_progress.value:
@@ -784,26 +426,70 @@ async def handle_user_input(writer, game_in_progress, logged_in):
 
             elif command == "CREATE_ROOM":
                 if len(params) != 2:
-                    print("用法：create <public/private> <rps/ttt/c4>")
+                    print("用法：create <public/private> <game_name>")
                     continue
-                # 支持遊戲類型的縮寫
-                game_type = params[1].lower()
-                if game_type in ['rps', 'rock_paper_scissors']:
-                    params[1] = 'rock_paper_scissors'
-                elif game_type in ['ttt', 'tictactoe']:
-                    params[1] = 'tictactoe'
-                elif game_type in ['c4', 'connectfour']:
-                    params[1] = 'connectfour'
+                room_type = params[0]
+                game_name = params[1]
+                if user_folder is None:
+                    print("尚未設定用戶專屬資料夾。")
+                    logging.error("用戶專屬資料夾未設定。")
+                    continue
+                game_folder = user_folder
+                file_path = os.path.join(game_folder, game_name + '.py')
+                logging.debug(f"遊戲檔案路徑：{file_path}")
+                if not os.path.exists(file_path):
+                    print(f"遊戲檔案 {game_name}.py 不存在，正在從伺服器下載...")
                 else:
-                    print("無效的遊戲類型。可用遊戲：rps、ttt、c4")
+                    print(f"遊戲檔案 {game_name}.py 已存在，更新中...")
+                download_future = asyncio.get_event_loop().create_future()
+                pending_downloads[game_name] = download_future
+                await send_command(writer, "DOWNLOAD_GAME_FILE", [game_name])
+                try:
+                    await asyncio.wait_for(download_future, timeout=10)
+                except asyncio.TimeoutError:
+                    print("下載遊戲檔案超時。")
+                    del pending_downloads[game_name]
                     continue
-                await send_command(writer, "CREATE_ROOM", params)
+                except Exception as e:
+                    print(f"下載遊戲檔案失敗：{e}")
+                    del pending_downloads[game_name]
+                    continue
+                await send_command(writer, "CREATE_ROOM", [room_type, game_name])
 
             elif command == "JOIN_ROOM":
                 if len(params) != 1:
                     print("用法：join <房間ID>")
                     continue
-                await send_command(writer, "JOIN_ROOM", params)
+                room_id = params[0]
+                if room_id not in room_info:
+                    print("未知的房間ID，請先使用 'status' 指令查看可用房間。")
+                    continue
+                game_name = room_info[room_id]
+                if user_folder is None:
+                    print("尚未設定用戶專屬資料夾。")
+                    logging.error("用戶專屬資料夾未設定。")
+                    continue
+                game_folder = user_folder
+                file_path = os.path.join(game_folder, game_name + '.py')
+                logging.debug(f"遊戲檔案路徑：{file_path}")
+                if not os.path.exists(file_path):
+                    print(f"遊戲檔案 {game_name}.py 不存在，正在從伺服器下載...")
+                else:
+                    print(f"遊戲檔案 {game_name}.py 已存在，更新中...")
+                download_future = asyncio.get_event_loop().create_future()
+                pending_downloads[game_name] = download_future
+                await send_command(writer, "DOWNLOAD_GAME_FILE", [game_name])
+                try:
+                    await asyncio.wait_for(download_future, timeout=10)
+                except asyncio.TimeoutError:
+                    print("下載遊戲檔案超時。")
+                    del pending_downloads[game_name]
+                    continue
+                except Exception as e:
+                    print(f"下載遊戲檔案失敗：{e}")
+                    del pending_downloads[game_name]
+                    continue
+                await send_command(writer, "JOIN_ROOM", [room_id])
 
             elif command == "INVITE_PLAYER":
                 if len(params) != 2:
@@ -820,7 +506,10 @@ async def handle_user_input(writer, game_in_progress, logged_in):
                 else:
                     print("\n=== 您的邀請列表 ===")
                     for idx, invite in enumerate(pending_invitations, start=1):
-                        print(f"{idx}. 來自 {invite['inviter']} 的房間 {invite['room_id']}")
+                        inviter = invite['inviter']
+                        room_id = invite['room_id']
+                        game_name = room_info.get(room_id, '未知')
+                        print(f"{idx}. 來自 {inviter} 的房間 {room_id}，遊戲：{game_name}")
                     print("====================")
                     response = await get_user_input("輸入邀請編號以接受，或輸入 'no' 來返回：")
                     if response.isdigit():
@@ -843,6 +532,64 @@ async def handle_user_input(writer, game_in_progress, logged_in):
                     print("尚未登入。")
                     continue
                 await send_command(writer, "START_GAME", [])
+            elif command == "UPLOAD_GAME":
+                if not logged_in.value:
+                    print("尚未登入。")
+                    continue
+                if len(params) != 1:
+                    print("用法：upload_game <game_file_name>")
+                    continue
+                game_file_name = params[0]
+                game_description = await get_user_input("輸入遊戲描述：")
+                if user_folder is None:
+                    print("尚未設定用戶專屬資料夾。")
+                    logging.error("用戶專屬資料夾未設定。")
+                    continue
+                game_folder = user_folder
+                file_path = os.path.join(game_folder, game_file_name + '.py')
+                if not os.path.exists(file_path):
+                    print(f"遊戲檔案 {file_path} 不存在。")
+                    continue
+                upload_ready_future = asyncio.get_event_loop().create_future()
+                pending_uploads[game_file_name] = upload_ready_future
+                await send_command(writer, "UPLOAD_GAME", [game_file_name, game_description])
+                try:
+                    await asyncio.wait_for(upload_ready_future, timeout=10)
+                except asyncio.TimeoutError:
+                    print("伺服器未回應。")
+                    del pending_uploads[game_file_name]
+                    continue
+                except Exception as e:
+                    print(f"上傳遊戲時發生錯誤：{e}")
+                    del pending_uploads[game_file_name]
+                    continue
+                try:
+                    async with aiofiles.open(file_path, 'rb') as f:
+                        file_content = await f.read()
+                    file_size = len(file_content)
+                    await send_message(writer, {'file_size': file_size})
+                    await writer.drain() 
+                    writer.write(file_content)
+                    await writer.drain()
+                    upload_confirm_future = asyncio.get_event_loop().create_future()
+                    pending_upload_confirms[game_file_name] = upload_confirm_future
+                    try:
+                        await asyncio.wait_for(upload_confirm_future, timeout=10)
+                        print("遊戲上傳成功。")
+                        del pending_upload_confirms[game_file_name]
+                        continue
+                    except asyncio.TimeoutError:
+                        print("伺服器未確認上傳結果。")
+                        del pending_upload_confirms[game_file_name]
+                        continue
+                except Exception as e:
+                    print(f"上傳遊戲時發生錯誤：{e}")
+                    continue
+            elif command == "LIST_OWN_GAMES":
+                if not logged_in.value:
+                    print("尚未登入。")
+                    continue
+                await send_command(writer, "LIST_OWN_GAMES", [])
             else:
                 print("未知的指令。請輸入 'help' 查看可用指令。")
         except KeyboardInterrupt:
@@ -888,7 +635,7 @@ async def main():
     logged_in = type('', (), {'value': False})()
 
     asyncio.create_task(handle_server_messages(reader, writer, game_in_progress, logged_in))
-    asyncio.create_task(handle_user_input(writer, game_in_progress, logged_in))
+    asyncio.create_task(handle_user_input(reader, writer, game_in_progress, logged_in))
 
     print("\n可用的指令：")
     for cmd in COMMANDS:
