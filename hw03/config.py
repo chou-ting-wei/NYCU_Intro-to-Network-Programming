@@ -1,0 +1,7 @@
+HOST = '127.0.0.1'
+# linux4
+# HOST = '140.113.235.154'
+PORT = 47298
+LOG_FILE = 'server.log'
+
+P2P_PORT_RANGE = (62838, 63021)
