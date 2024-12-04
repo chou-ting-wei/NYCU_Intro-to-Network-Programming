@@ -50,7 +50,7 @@ COMMANDS = [
     "start - 開始遊戲（房主專用）",
     "leave - 離開當前房間",
     "inv - 查看和管理您的邀請",
-    "upload_game <game_file_name> - 上傳遊戲文件",
+    "upload_game <game_name> - 上傳遊戲文件",
     "list_games - 列出自己發布的遊戲",
     "exit - 離開客戶端",
     "help - 顯示可用指令列表",
