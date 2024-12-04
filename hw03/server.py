@@ -188,54 +188,6 @@ async def broadcast(message):
     for writer in writers:
         await send_message(writer, message)
 
-
-# async def send_lobby_info(writer):
-#     try:
-#         async with online_users_lock:
-#             users_data = [
-#                 {"username": user, "status": info["status"]}
-#                 for user, info in online_users.items()
-#             ]
-        
-#         async with game_rooms_lock:
-#             public_rooms_data = [
-#                 {
-#                     "room_id": r_id,
-#                     "creator": room["creator"],
-#                     "game_name": room["game_name"],
-#                     "status": room["status"],
-#                     "host": room["host"]
-#                 }
-#                 for r_id, room in game_rooms.items()
-#                 # if room["type"] == "public" and room["status"] != "In Game"
-#                 if room["type"] == "public"
-#             ]
-        
-#         status_message = "=== 公開房間列表 ===\n"
-#         if not public_rooms_data:
-#             status_message += "無公開房間等待玩家。\n"
-#         else:
-#             for room in public_rooms_data:
-#                 status_message += f"房間ID: {room['room_id']} | 創建者: {room['creator']} | 房主： {room['host']} | 遊戲類型: {room['game_name']} | 狀態: {room['status']}\n"
-        
-#         status_message += "=====================\n\n"
-#         status_message += "=== 在線用戶列表 ===\n"
-#         if not users_data:
-#             status_message += "無玩家在線。\n"
-#         else:
-#             for user in users_data:
-#                 status_message += f"玩家: {user['username']} - 狀態: {user['status']}\n"
-#         status_message += "=====================\n"
-        
-#         status_response = {
-#             "status": "status",
-#             "message": status_message
-#         }
-#         await send_message(writer, json.dumps(status_response) + '\n')
-#         logger.info("發送 SHOW_STATUS 訊息給用戶。")
-#     except Exception as e:
-#         logger.error(f"發送大廳信息失敗: {e}")
-
 async def broadcast_lobby_info():
     lobby_info = await get_lobby_info()
     message = json.dumps(lobby_info) + '\n'
@@ -630,8 +582,8 @@ async def handle_invite_player(params, username, writer):
             await send_message(writer, build_response("error", "Room does not exist"))
             return
         room = game_rooms[room_id]
-        if room['creator'] != username:
-            await send_message(writer, build_response("error", "Only room creator can invite players"))
+        if room['host'] != username:
+            await send_message(writer, build_response("error", "Only room host can invite players"))
             return
         if room['type'] != 'private':
             await send_message(writer, build_response("error", "Cannot invite players to a public room"))
@@ -800,55 +752,6 @@ async def handle_decline_invite(params, username, writer):
             if username in room['invited_users']:
                 room['invited_users'].remove(username)
     await send_message(writer, build_response("success", f"DECLINE_INVITE_SUCCESS {room_id}"))
-
-
-# async def handle_show_status(writer):
-#     try:
-#         async with online_users_lock:
-#             users_data = [
-#                 {"username": user, "status": info["status"]}
-#                 for user, info in online_users.items()
-#             ]
-        
-#         async with game_rooms_lock:
-#             public_rooms_data = [
-#                 {
-#                     "room_id": r_id,
-#                     "creator": room["creator"],
-#                     "game_name": room["game_name"],
-#                     "status": room["status"],
-#                     "host": room["host"]
-#                 }
-#                 for r_id, room in game_rooms.items()
-#                 # if room["type"] == "public" and room["status"] != "In Game"
-#                 if room["type"] == "public"
-#             ]
-        
-#         status_message = "=== 公開房間列表 ===\n"
-#         if not public_rooms_data:
-#             status_message += "無公開房間等待玩家。\n"
-#         else:
-#             for room in public_rooms_data:
-#                 status_message += f"房間 ID: {room['room_id']} | 創建者: {room['creator']} | 房主： {room['host']} | 遊戲類型: {room['game_name']} | 狀態: {room['status']}\n"
-        
-#         status_message += "=====================\n\n"
-#         status_message += "=== 在線用戶列表 ===\n"
-#         if not users_data:
-#             status_message += "無玩家在線。\n"
-#         else:
-#             for user in users_data:
-#                 status_message += f"玩家: {user['username']} - 狀態: {user['status']}\n"
-#         status_message += "=====================\n"
-        
-#         status_response = {
-#             "status": "status",
-#             "message": status_message
-#         }
-#         await send_message(writer, json.dumps(status_response) + '\n')
-#         logger.info("發送 SHOW_STATUS 訊息給用戶。")
-#     except Exception as e:
-#         logger.error(f"處理 SHOW_STATUS 時發生錯誤: {e}")
-#         await send_message(writer, build_response("error", "Failed to retrieve status"))
 
 async def handle_show_status(writer):
     try:

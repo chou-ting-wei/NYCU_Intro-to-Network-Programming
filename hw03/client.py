@@ -72,6 +72,7 @@ async def setup_user_directory(username):
     global user_folder
     username_hash = get_username_hash(username)
     user_folder = f"games-{username_hash}"
+    peer_info_path = os.path.join(user_folder, "peer_info.json")
     try:
         if not await aiofiles.os.path.exists(user_folder):
             await aiofiles.os.makedirs(user_folder)
@@ -80,6 +81,22 @@ async def setup_user_directory(username):
         else:
             print(f"資料夾已存在：{user_folder}")
             logging.info(f"資料夾已存在：{user_folder}")
+            
+        if not await aiofiles.os.path.exists(peer_info_path):
+            initial_peer_info = {
+                "role": None,
+                "peer_ip": None,
+                "peer_port": None,
+                "own_port": None,
+                "game_name": None
+            }
+            async with aiofiles.open(peer_info_path, 'w') as f:
+                await f.write(json.dumps(initial_peer_info, ensure_ascii=False, indent=4))
+            print(f"已創建 peer_info.json 文件。")
+            logging.info(f"已創建 peer_info.json 文件：{peer_info_path}")
+        else:
+            print(f"peer_info.json 文件已存在：{peer_info_path}")
+            logging.info(f"peer_info.json 文件已存在：{peer_info_path}")
     except Exception as e:
         print(f"設定用戶資料夾時發生錯誤：{e}")
         logging.error(f"設定用戶資料夾時發生錯誤：{e}")
@@ -188,12 +205,13 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                 elif status == "invite":
                     inviter = message_json.get("from")
                     room_id = message_json.get("room_id")
+                    game_name = message_json.get("game_name", "未知")
                     invitation = {"inviter": inviter, "room_id": room_id}
                     pending_invitations.append(invitation)
-                    game_name = message_json.get("game_name", "未知")
                     room_info[room_id] = game_name
-                    print(f"\n[邀請通知] 您收到來自 {inviter} 的房間 {room_id} 邀請。使用 'inv' 指令來查看和管理您的邀請。")
+                    print(f"\n[邀請通知] 您收到來自 {inviter} 的房間 {room_id} 邀請，遊戲：{game_name}。使用 'inv' 指令來查看和管理您的邀請。")
 
+                
                 elif status == "invite_declined":
                     decline_from = message_json.get("from")
                     room_id = message_json.get("room_id")
@@ -226,16 +244,28 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                         room_id = message_json.get("room_id")
                         status_update = message_json.get("status")
                         print(f"\n房間 {room_id} 狀態更新為 {status_update}")
+                
                 elif status == "p2p_info":
-                    peer_info["role"] = message_json.get("role")
-                    peer_info["peer_ip"] = message_json.get("peer_ip")
-                    peer_info["peer_port"] = message_json.get("peer_port")
-                    peer_info["own_port"] = message_json.get("own_port")
-                    peer_info["game_name"] = message_json.get("game_name")
+                    new_peer_info = {
+                        "role": message_json.get("role"),
+                        "peer_ip": message_json.get("peer_ip"),
+                        "peer_port": message_json.get("peer_port"),
+                        "own_port": message_json.get("own_port"),
+                        "game_name": message_json.get("game_name")
+                    }
+                    await update_peer_info(new_peer_info)
+                    peer_info = await read_peer_info()
+                    
                     logging.debug(f"角色：{peer_info['role']}，對等方 IP：{peer_info['peer_ip']}，對等方 Port：{peer_info['peer_port']}，自身 Port：{peer_info['own_port']}，遊戲類型：{peer_info['game_name']}")
                     print(f"角色：{peer_info['role']}，對等方 IP：{peer_info['peer_ip']}，對等方 Port：{peer_info['peer_port']}，自身 Port：{peer_info['own_port']}")
-                    asyncio.create_task(initiate_game(peer_info["game_name"], game_in_progress, writer))
+                    
+                    if None in [peer_info["role"], peer_info["peer_ip"], peer_info["peer_port"], peer_info["own_port"], peer_info["game_name"]]:
+                        print("錯誤：收到不完整的 p2p_info 消息。")
+                        logging.error("收到不完整的 p2p_info 消息。")
+                        return
+                    asyncio.create_task(initiate_game(peer_info["game_name"], game_in_progress, writer, user_folder))
                     game_in_progress.value = True
+                
                 elif status == "host_transfer":
                     new_host = message_json.get("new_host")
                     room_id = message_json.get("room_id")
@@ -281,14 +311,56 @@ async def handle_server_messages(reader, writer, game_in_progress, logged_in):
                 game_in_progress.value = False
             break
 
-async def initiate_game(game_name, game_in_progress, writer):
+async def read_peer_info():
+    global user_folder
+    peer_info_path = os.path.join(user_folder, "peer_info.json")
     try:
-        game_folder = 'games'
+        async with aiofiles.open(peer_info_path, 'r') as f:
+            content = await f.read()
+            return json.loads(content)
+    except Exception as e:
+        print(f"讀取 peer_info.json 時發生錯誤：{e}")
+        logging.error(f"讀取 peer_info.json 時發生錯誤：{e}")
+        return None
+
+async def update_peer_info(new_info):
+    global user_folder
+    peer_info_path = os.path.join(user_folder, "peer_info.json")
+    try:
+        current_info = await read_peer_info()
+        if current_info is None:
+            current_info = {}
+        current_info.update(new_info)
+        async with aiofiles.open(peer_info_path, 'w') as f:
+            await f.write(json.dumps(current_info, ensure_ascii=False, indent=4))
+        logging.info(f"更新 peer_info.json：{new_info}")
+    except Exception as e:
+        print(f"更新 peer_info.json 時發生錯誤：{e}")
+        logging.error(f"更新 peer_info.json 時發生錯誤：{e}")
+
+async def initiate_game(game_name, game_in_progress, writer, user_folder):
+    try:
+        game_folder = user_folder if user_folder else 'games'  # 確保使用正確的遊戲目錄
         file_path = os.path.join(game_folder, game_name + ".py")
         print(f"正在執行遊戲 {game_name}...")
         if not os.path.exists(file_path):
             print(f"遊戲檔案 {game_name} 不存在。")
+            logging.error(f"遊戲檔案 {game_name} 不存在於 {game_folder}。")
             return
+
+        peer_info = await read_peer_info()
+        if peer_info is None:
+            print("錯誤：無法讀取 peer_info。")
+            logging.error("無法讀取 peer_info。")
+            return
+        
+        required_fields = ["role", "peer_ip", "peer_port", "own_port", "game_name"]
+        missing_fields = [field for field in required_fields if peer_info.get(field) is None]
+        if missing_fields:
+            print(f"錯誤：peer_info 缺少字段：{', '.join(missing_fields)}")
+            logging.error(f"peer_info 缺少字段：{', '.join(missing_fields)}")
+            return
+
         game_globals = {}   
         game_globals['peer_info'] = peer_info
         try:
@@ -296,9 +368,10 @@ async def initiate_game(game_name, game_in_progress, writer):
                 code = await f.read()
             exec(code, game_globals)
             if 'main' in game_globals and callable(game_globals['main']):
-                await game_globals['main']()
+                await game_globals['main'](peer_info)
             else:
                 print("遊戲腳本不包含 main() 函數。")
+                logging.error("遊戲腳本不包含 main() 函數。")
         except Exception as e:
             print(f"讀取或執行遊戲腳本時發生錯誤：{e}")
             logging.error(f"讀取或執行遊戲腳本時發生錯誤：{e}")
@@ -308,31 +381,6 @@ async def initiate_game(game_name, game_in_progress, writer):
     finally:
         game_in_progress.value = False
         await send_command(writer, "GAME_OVER", [])
-    # try:
-    #     if game_name is None:
-    #         raise ValueError("game_name 未定義")
-        
-    #     if game_name.lower() == 'rps' or game_name.lower() == 'rock_paper_scissors':
-    #         if peer_info.get("role") == "host":
-    #             await start_rps_game_as_host(peer_info.get("own_port"))
-    #         elif peer_info.get("role") == "client":
-    #             await start_rps_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
-    #     elif game_name.lower() == 'ttt' or game_name.lower() == 'tictactoe':
-    #         if peer_info.get("role") == "host":
-    #             await start_tictactoe_game_as_host(peer_info.get("own_port"))
-    #         elif peer_info.get("role") == "client":
-    #             await start_tictactoe_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
-    #     elif game_name.lower() == 'c4' or game_name.lower() == 'connectfour':
-    #         if peer_info.get("role") == "host":
-    #             await start_connectfour_game_as_host(peer_info.get("own_port"))
-    #         elif peer_info.get("role") == "client":
-    #             await start_connectfour_game_as_client(peer_info.get("peer_ip"), peer_info.get("peer_port"))
-    #     else:
-    #         logging.error("無效的遊戲類型")
-    #         print("無效的遊戲類型")
-    # finally:
-    #     game_in_progress.value = False
-    #     await send_command(writer, "GAME_OVER", [])
 
 def display_online_users(online_users):
     print("\n=== 在線用戶列表 ===")
@@ -346,9 +394,9 @@ def display_online_users(online_users):
     print("=====================")
 
 def display_public_rooms(rooms):
-    print("\n=== 公開房間列表 ===")
+    print("\n===== 房間列表 =====")
     if not rooms:
-        print("無公開房間等待玩家。")
+        print("無房間等待玩家。")
     else:
         for room in rooms:
             room_id = room.get("room_id", "未知")
