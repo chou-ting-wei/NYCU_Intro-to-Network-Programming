@@ -1,6 +1,6 @@
-HOST = '127.0.0.1'
+# HOST = '127.0.0.1'
 # linux1
-# HOST = '140.113.235.151'
+HOST = '140.113.235.151'
 PORT = 47298
 LOG_FILE = 'server.log'
 
